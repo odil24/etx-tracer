@@ -48,6 +48,11 @@ struct SceneRepresentation {
   void rebuild_area_emitters();
   void set_mesh_material(uint32_t mesh_index, uint32_t material_index);
 
+  uint32_t add_environment_emitter(const float3& color, uint32_t medium_index);
+  uint32_t add_directional_emitter(const float3& direction, const float3& color, float angular_diameter_degrees, uint32_t medium_index);
+  void add_atmosphere_emitter(const float3& direction, float angular_diameter_degrees, float quality, float scale, float sun_scale, float sky_scale, float anisotropy,
+    float altitude, float rayleigh, float mie, float ozone);
+
   Camera& camera();
   const Camera& camera() const;
 
@@ -57,11 +62,14 @@ struct SceneRepresentation {
 };
 
 void build_camera(Camera& camera, const float3& position, const float3& direction, const float3& up, const uint2& viewport, const float fov);
+void compute_camera_position_to_fit_scene(const Scene& scene_data, const Camera& camera, const float3& view_direction, float3& out_position, float3& out_target);
 
 float get_camera_fov(const Camera& camera);
 float get_camera_focal_length(const Camera& camera);
 float fov_to_focal_length(float fov);
 float focal_length_to_fov(float focal_len);
+float horizontal_fov_to_vertical_fov(float horizontal_fov);
+float vertical_fov_to_horizontal_fov(float vertical_fov);
 
 const char* material_class_to_string(Material::Class cls);
 void material_class_to_string(Material::Class cls, const char** str);

@@ -3,6 +3,7 @@
 #include <etx/render/host/image_pool.hxx>
 #include <etx/render/host/image_loaders.hxx>
 #include <etx/render/host/distribution_builder.hxx>
+#include <etx/render/shared/math.hxx>
 
 #include <atomic>
 #include <vector>
@@ -85,6 +86,147 @@ struct ImagePoolImpl {
     }
 
     return handle;
+  }
+
+  static float evaluate_sh_basis(uint32_t index, const float3& dir) {
+    float x = dir.x;
+    float y = dir.y;
+    float z = dir.z;
+
+    switch (index) {
+      case 0:
+        return 0.282095f;
+      case 1:
+        return 0.488603f * y;
+      case 2:
+        return 0.488603f * z;
+      case 3:
+        return 0.488603f * x;
+      case 4:
+        return 1.092548f * x * y;
+      case 5:
+        return 1.092548f * y * z;
+      case 6:
+        return 0.315392f * (3.0f * z * z - 1.0f);
+      case 7:
+        return 1.092548f * x * z;
+      case 8:
+        return 0.546274f * (x * x - y * y);
+      default:
+        return 0.0f;
+    }
+  }
+
+  uint32_t add_from_spherical_harmonics(const float3 sh_coeffs[9], const uint2& dimensions, uint32_t image_options, const float2& offset, const float2& scale) {
+    std::vector<float4> image_data(dimensions.x * dimensions.y);
+
+    scheduler.execute(dimensions.x * dimensions.y, [&image_data, &dimensions, &sh_coeffs, &offset, &scale](uint32_t begin, uint32_t end, uint32_t) {
+      for (uint32_t i = begin; i < end; ++i) {
+        uint32_t x = i % dimensions.x;
+        uint32_t y = i / dimensions.x;
+
+        float u = (float(x) + 0.5f) / float(dimensions.x);
+        float v = (float(y) + 0.5f) / float(dimensions.y);
+
+        float3 dir = uv_to_direction({u, v}, offset, scale.x);
+
+        float3 color = {};
+        for (uint32_t j = 0; j < 9; ++j) {
+          float basis = evaluate_sh_basis(j, dir);
+          color = color + sh_coeffs[j] * basis;
+        }
+
+        float3 linear = gamma_to_linear({max(0.0f, color.x), max(0.0f, color.y), max(0.0f, color.z)});
+        image_data[i] = {linear.x, linear.y, linear.z, 1.0f};
+      }
+    });
+
+    return add_from_data(image_data.data(), dimensions, image_options, offset, scale);
+  }
+
+  uint32_t add_from_cubemap(const uint32_t cube_face_images[6], const uint2& dimensions, uint32_t image_options, const float2& offset, const float2& scale) {
+    bool needs_srgb_conversion[6] = {};
+    for (size_t i = 0; i < 6; ++i) {
+      const auto& face_img = images[cube_face_images[i]];
+      needs_srgb_conversion[i] = (face_img.format == Image::Format::RGBA8);
+    }
+
+    std::vector<float4> equirect_data(dimensions.x * dimensions.y);
+
+    scheduler.execute(dimensions.x * dimensions.y,
+      [&equirect_data, &dimensions, &cube_face_images, &needs_srgb_conversion, &offset, &scale, this](uint32_t begin, uint32_t end, uint32_t) {
+        for (uint32_t i = begin; i < end; ++i) {
+          uint32_t x = i % dimensions.x;
+          uint32_t y = i / dimensions.x;
+
+          float u = (float(x) + 0.5f) / float(dimensions.x);
+          float v = (float(y) + 0.5f) / float(dimensions.y);
+
+          float3 dir = uv_to_direction({u, v}, offset, scale.x);
+
+          float3 abs_dir = {fabsf(dir.x), fabsf(dir.y), fabsf(dir.z)};
+          int face_idx = 0;
+          float2 cube_uv = {};
+
+          if (abs_dir.x >= abs_dir.y && abs_dir.x >= abs_dir.z) {
+            if (dir.x >= 0.0f) {
+              face_idx = 0;
+              cube_uv = {-dir.z / dir.x, -dir.y / dir.x};
+            } else {
+              face_idx = 1;
+              cube_uv = {dir.z / dir.x, -dir.y / dir.x};
+            }
+          } else if (abs_dir.y >= abs_dir.z) {
+            if (dir.y >= 0.0f) {
+              face_idx = 2;
+              cube_uv = {dir.x / dir.y, dir.z / dir.y};
+            } else {
+              face_idx = 3;
+              cube_uv = {dir.x / dir.y, dir.z / dir.y};
+            }
+          } else {
+            if (dir.z >= 0.0f) {
+              face_idx = 4;
+              cube_uv = {dir.x / dir.z, -dir.y / dir.z};
+            } else {
+              face_idx = 5;
+              cube_uv = {-dir.x / dir.z, -dir.y / dir.z};
+            }
+          }
+
+          cube_uv = cube_uv * 0.5f + 0.5f;
+
+          bool flip_v = true;
+          switch (face_idx) {
+            case 1:
+              cube_uv.x = 1.0f - cube_uv.x;
+              flip_v = false;
+              break;
+            case 3:
+              cube_uv.x = 1.0f - cube_uv.x;
+              break;
+            case 5:
+              cube_uv.x = 1.0f - cube_uv.x;
+              flip_v = false;
+              break;
+          }
+          if (flip_v) {
+            cube_uv.y = 1.0f - cube_uv.y;
+          }
+
+          const auto& face_image = images[cube_face_images[face_idx]];
+          float4 color = face_image.evaluate(cube_uv, nullptr);
+
+          if (needs_srgb_conversion[face_idx]) {
+            float3 linear = gamma_to_linear({color.x, color.y, color.z});
+            color = {linear.x, linear.y, linear.z, color.w};
+          }
+
+          equirect_data[i] = color;
+        }
+      });
+
+    return add_from_data(equirect_data.data(), dimensions, image_options, offset, scale);
   }
 
   void perform_loading(uint32_t handle, Image& image) {
@@ -309,6 +451,14 @@ uint32_t ImagePool::add_from_file(const std::string& path, uint32_t image_option
 
 uint32_t ImagePool::add_from_data(const float4* data, const uint2& dimensions, uint32_t image_options, const float2& offset, const float2& scale) {
   return _private->add_from_data(data, dimensions, image_options, offset, scale);
+}
+
+uint32_t ImagePool::add_from_spherical_harmonics(const float3 sh_coeffs[9], const uint2& dimensions, uint32_t image_options, const float2& offset, const float2& scale) {
+  return _private->add_from_spherical_harmonics(sh_coeffs, dimensions, image_options, offset, scale);
+}
+
+uint32_t ImagePool::add_from_cubemap(const uint32_t cube_face_images[6], const uint2& dimensions, uint32_t image_options, const float2& offset, const float2& scale) {
+  return _private->add_from_cubemap(cube_face_images, dimensions, image_options, offset, scale);
 }
 
 const Image& ImagePool::get(uint32_t handle) {

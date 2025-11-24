@@ -634,10 +634,9 @@ bool LoadObjWithCallback(std::istream& inStream, const callback_t& callback, voi
 /// Returns true when loading .obj become success.
 /// Returns warning and error message into `err`
 bool LoadObj(attrib_t* attrib, std::vector<shape_t>* shapes, std::vector<material_t>* materials, std::string* warn, std::string* err, std::istream* inStream,
-  MaterialReader* readMatFn, const std::string& customMaterials, bool triangulate = true, bool default_vcols_fallback = true);
+  MaterialReader* readMatFn, const char* customMaterials, bool triangulate = true, bool default_vcols_fallback = true);
 
-bool LoadObjMaterials(std::vector<material_t>* materials, std::string* warn, std::string* err, std::istream* inStream, MaterialReader* readMatFn,
-  const std::string& customMaterials);
+bool LoadObjMaterials(std::vector<material_t>* materials, std::string* warn, std::string* err, std::istream* inStream, MaterialReader* readMatFn, const char*& customMaterials);
 
 /// Loads materials into std::map
 void LoadMtl(std::map<std::string, int>* material_map, std::vector<material_t>* materials, std::istream* inStream, std::string* warning, std::string* err);
@@ -2333,7 +2332,7 @@ bool LoadObjMaterials(std::vector<material_t>* materials, std::string* warn, std
 }
 
 bool LoadObj(attrib_t* attrib, std::vector<shape_t>* shapes, std::vector<material_t>* materials, std::string* warn, std::string* err, std::istream* inStream,
-  MaterialReader* readMatFn, const std::string& customMaterials, bool triangulate, bool default_vcols_fallback) {
+  MaterialReader* readMatFn, const char* customMaterials, bool triangulate, bool default_vcols_fallback) {
   auto t0 = std::chrono::steady_clock::now();
   std::stringstream errss;
 
@@ -2624,7 +2623,7 @@ bool LoadObj(attrib_t* attrib, std::vector<shape_t>* shapes, std::vector<materia
         token += 7;
 
         std::vector<std::string> filenames;
-        if (customMaterials.empty()) {
+        if ((customMaterials == nullptr) || (customMaterials[0] == 0)) {
           SplitString(std::string(token), ' ', '\\', filenames);
         } else {
           filenames.emplace_back(customMaterials);
@@ -2891,8 +2890,7 @@ bool LoadObj(attrib_t* attrib, std::vector<shape_t>* shapes, std::vector<materia
   return true;
 }
 
-bool LoadObjMaterials(std::vector<material_t>* materials, std::string* warn, std::string* err, std::istream* inStream, MaterialReader* readMatFn,
-  const std::string& customMaterials) {
+bool LoadObjMaterials(std::vector<material_t>* materials, std::string* warn, std::string* err, std::istream* inStream, MaterialReader* readMatFn, const char*& customMaterials) {
   std::stringstream errss;
 
   // material
@@ -2937,7 +2935,7 @@ bool LoadObjMaterials(std::vector<material_t>* materials, std::string* warn, std
         token += 7;
 
         std::vector<std::string> filenames;
-        if (customMaterials.empty()) {
+        if ((customMaterials == nullptr) || (customMaterials[0] == 0)) {
           SplitString(std::string(token), ' ', '\\', filenames);
         } else {
           filenames.emplace_back(customMaterials);

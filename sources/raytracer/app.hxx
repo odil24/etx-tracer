@@ -52,6 +52,7 @@ struct RTApplication {
   void on_medium_changed(uint32_t index);
   void on_mesh_material_changed(uint32_t mesh_index, uint32_t material_index);
   void on_emitter_changed(uint32_t index);
+  void on_emitter_added(uint32_t type);
   void on_camera_changed(bool film_changed);
   void on_scene_settings_changed();
   void on_denoise_selected();
@@ -61,6 +62,7 @@ struct RTApplication {
  private:
   void add_to_recent(const std::string&);
   void save_options();
+  void update_camera_to_fit_scene(const float3& view_direction);
 
  private:
   UI ui;

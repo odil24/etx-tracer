@@ -3,6 +3,7 @@
 #include <etx/core/log.hxx>
 
 #include <etx/render/host/film.hxx>
+#include <etx/render/host/scene_representation.hxx>
 #include <etx/render/shared/camera.hxx>
 #include <etx/render/shared/ior_database.hxx>
 #include <etx/render/shared/math.hxx>
@@ -1756,6 +1757,47 @@ void UI::build_scene_objects_window(Scene& scene, const BuildContext& ctx, const
     ImGui::SameLine();
     draw_history_button(" > ##selection_history_forward", can_navigate_forward(), 1);
 
+    if (!ctx.scene_editable)
+      ImGui::BeginDisabled();
+    ImGui::SameLine();
+    const char* add_scene_object_popup_id = "##add_scene_object_popup";
+    if (ImGui::Button(" + ##add_scene_object")) {
+      ImGui::OpenPopup(add_scene_object_popup_id);
+    }
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 20.0f, 0.0f), ImGuiCond_Always);
+    if (ImGui::BeginPopup(add_scene_object_popup_id)) {
+      if (ImGui::Selectable("Add Medium")) {
+        if (callbacks.medium_added) {
+          callbacks.medium_added();
+          _medium_mapping.build(mediums);
+          _medium_mapping_hash = hash_mapping(mediums);
+        }
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::Separator();
+      if (ImGui::Selectable("Add Environment Emitter")) {
+        if (callbacks.emitter_added) {
+          callbacks.emitter_added(0);
+        }
+        ImGui::CloseCurrentPopup();
+      }
+      if (ImGui::Selectable("Add Directional Emitter")) {
+        if (callbacks.emitter_added) {
+          callbacks.emitter_added(1);
+        }
+        ImGui::CloseCurrentPopup();
+      }
+      if (ImGui::Selectable("Add Atmosphere Emitter")) {
+        if (callbacks.emitter_added) {
+          callbacks.emitter_added(2);
+        }
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+    if (!ctx.scene_editable)
+      ImGui::EndDisabled();
+
     ImGui::Spacing();
     ImGui::Separator();
 
@@ -1816,18 +1858,8 @@ void UI::build_scene_objects_window(Scene& scene, const BuildContext& ctx, const
 
     ImGui::Separator();
 
+    ImGui::AlignTextToFramePadding();
     ImGui::Text("Mediums (%zu)", _medium_mapping.size());
-    if (!ctx.scene_editable)
-      ImGui::BeginDisabled();
-    if (ImGui::Button("Add Medium", ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
-      if (callbacks.medium_added) {
-        callbacks.medium_added();
-        _medium_mapping.build(mediums);
-        _medium_mapping_hash = hash_mapping(mediums);
-      }
-    }
-    if (!ctx.scene_editable)
-      ImGui::EndDisabled();
     ImGui::Spacing();
     if (_medium_mapping.empty()) {
       ImGui::TextDisabled("None");
@@ -1845,8 +1877,9 @@ void UI::build_scene_objects_window(Scene& scene, const BuildContext& ctx, const
     }
 
     ImGui::Separator();
-
+    ImGui::AlignTextToFramePadding();
     ImGui::Text("Emitters (%u)", scene.emitter_profiles.count);
+    ImGui::Spacing();
     if (scene.emitter_profiles.count == 0) {
       ImGui::TextDisabled("None");
     } else if (ImGui::BeginListBox("##emitters_list", ImVec2(-FLT_MIN, kDefaultListHeight))) {
@@ -2390,10 +2423,57 @@ void UI::build_camera_selection_properties(Scene& scene, Camera& camera, const B
     ImGui::BeginDisabled();
 
   if (ImGui::CollapsingHeader("Lens & Focus", ImGuiTreeNodeFlags_Framed)) {
-    if (labeled_control("Focal Length", [&]() {
-          return ImGui::DragFloat("##focal_length", &focal_len, 0.1f, 1.0f, 5000.0f, "%.1fmm");
+    // Control mode selector
+    static int control_mode = 0;  // 0 = Focal Length, 1 = Field of View
+    const char* control_modes[] = {"Focal Length", "Field of View"};
+
+    if (labeled_control("Control Mode", [&]() {
+          return ImGui::Combo("##control_mode", &control_mode, control_modes, IM_ARRAYSIZE(control_modes));
         })) {
-      camera_changed = true;
+      // Mode changed, no immediate camera change needed
+    }
+
+    if (control_mode == 0) {
+      // Focal Length mode
+      if (labeled_control("Focal Length", [&]() {
+            return ImGui::DragFloat("##focal_length", &focal_len, 0.1f, 1.0f, 5000.0f, "%.1fmm");
+          })) {
+        camera_changed = true;
+      }
+    } else {
+      // Field of View mode
+      float current_fov_deg = focal_length_to_fov(focal_len) * 180.0f / kPi;
+      static float fov_input = current_fov_deg;  // Static to maintain value between frames
+      fov_input = current_fov_deg;               // Sync with current camera FOV
+
+      if (labeled_control("FOV (Horizontal)", [&]() {
+            return ImGui::InputFloat("##fov_input", &fov_input, 0.1f, 1.0f, "%.1f°");
+          })) {
+        focal_len = fov_to_focal_length(fov_input * kPi / 180.0f);
+        camera_changed = true;
+      }
+
+      // FOV conversion buttons
+      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 0));
+      ImGui::AlignTextToFramePadding();
+      ImGui::Text("Convert FOV");
+      ImGui::SameLine();
+      if (ImGui::Button("H -> V")) {
+        float horizontal_fov_rad = fov_input * kPi / 180.0f;
+        float vertical_fov_rad = horizontal_fov_to_vertical_fov(horizontal_fov_rad);
+        fov_input = vertical_fov_rad * 180.0f / kPi;
+        focal_len = fov_to_focal_length(horizontal_fov_rad);
+        camera_changed = true;
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("V -> H")) {
+        float vertical_fov_rad = fov_input * kPi / 180.0f;
+        float horizontal_fov_rad = vertical_fov_to_horizontal_fov(vertical_fov_rad);
+        fov_input = horizontal_fov_rad * 180.0f / kPi;
+        focal_len = fov_to_focal_length(horizontal_fov_rad);
+        camera_changed = true;
+      }
+      ImGui::PopStyleVar();
     }
 
     if (labeled_control("Focus Distance", [&]() {

@@ -64,6 +64,7 @@ void RTApplication::init() {
   ui.callbacks.medium_changed = std::bind(&RTApplication::on_medium_changed, this, std::placeholders::_1);
   ui.callbacks.mesh_material_changed = std::bind(&RTApplication::on_mesh_material_changed, this, std::placeholders::_1, std::placeholders::_2);
   ui.callbacks.emitter_changed = std::bind(&RTApplication::on_emitter_changed, this, std::placeholders::_1);
+  ui.callbacks.emitter_added = std::bind(&RTApplication::on_emitter_added, this, std::placeholders::_1);
   ui.callbacks.camera_changed = std::bind(&RTApplication::on_camera_changed, this, std::placeholders::_1);
   ui.callbacks.scene_settings_changed = std::bind(&RTApplication::on_scene_settings_changed, this);
   ui.callbacks.denoise_selected = std::bind(&RTApplication::on_denoise_selected, this);
@@ -421,6 +422,28 @@ void RTApplication::on_emitter_changed(uint32_t index) {
   integrator_thread.restart();
 }
 
+void RTApplication::on_emitter_added(uint32_t type) {
+  integrator_thread.stop(Integrator::Stop::Immediate);
+
+  switch (type) {
+    case 0: {  // Environment
+      scene.add_environment_emitter({1.0f, 1.0f, 1.0f}, kInvalidIndex);
+      break;
+    }
+    case 1: {  // Directional
+      scene.add_directional_emitter({0.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, 0.5422f, kInvalidIndex);
+      break;
+    }
+    case 2: {  // Atmosphere
+      scene.add_atmosphere_emitter({0.0f, 2.0f, 1.0f}, 0.5422f, 0.125f, 1.0f, 1.0f, 1.0f, 0.825f, 1000.0f, 1.0f, 1.0f, 1.0f);
+      break;
+    }
+  }
+
+  scene.rebuild_area_emitters();
+  integrator_thread.restart();
+}
+
 void RTApplication::on_camera_changed(bool film_changed) {
   if (film_changed) {
     integrator_thread.stop(Integrator::Stop::Immediate);
@@ -441,6 +464,12 @@ void RTApplication::on_denoise_selected() {
   ui.mutable_view_options().layer = Film::Denoised;
 }
 
+void RTApplication::update_camera_to_fit_scene(const float3& view_direction) {
+  float3 position, target;
+  compute_camera_position_to_fit_scene(scene.scene(), scene.camera(), view_direction, position, target);
+  camera_controller.schedule(position, target);
+}
+
 void RTApplication::on_view_scene(uint32_t direction) {
   constexpr float3 directions[] = {
     {1.0f, 1.0f, 1.0f},
@@ -452,10 +481,7 @@ void RTApplication::on_view_scene(uint32_t direction) {
     kWorldForward,
   };
   direction = clamp(direction, 0u, uint32_t(sizeof(directions) / sizeof(directions[0])));
-
-  const float3 position = 3.0f * scene.scene().bounding_sphere_radius * normalize(directions[direction]);
-  const auto view_center = scene.scene().bounding_sphere_center;
-  camera_controller.schedule(position, view_center);
+  update_camera_to_fit_scene(directions[direction]);
 }
 
 void RTApplication::on_clear_recent_files() {

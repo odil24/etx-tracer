@@ -135,4 +135,24 @@ ETX_GPU_CODE CameraEval film_evaluate_out(SpectralQuery spect, const Camera& cam
   return result;
 }
 
+ETX_GPU_CODE float3 clamp_view_direction_away_from_up(const float3& view_direction, const float3& up_vector, float min_cosine_threshold) {
+  constexpr float kAngleOffsetDegrees = 0.01f;
+  constexpr float kAngleOffsetRadians = kAngleOffsetDegrees * kPi / 180.0f;
+
+  float3 view_dir = normalize(view_direction);
+  const float up_dot = fabsf(dot(view_dir, up_vector));
+
+  if (up_dot > min_cosine_threshold) {
+    float3 right = cross(view_dir, up_vector);
+    if (length(right) < kEpsilon) {
+      right = cross(view_dir, kWorldRight);
+    }
+    right = normalize(right);
+    const float3 offset = right * kAngleOffsetRadians;
+    view_dir = normalize(view_dir + offset);
+  }
+
+  return view_dir;
+}
+
 }  // namespace etx

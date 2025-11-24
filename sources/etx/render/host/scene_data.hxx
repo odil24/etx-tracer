@@ -9,6 +9,7 @@
 #include <etx/render/host/image_pool.hxx>
 #include <etx/render/host/medium_pool.hxx>
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +53,7 @@ struct SceneData {
   MaterialMapping mesh_mapping;
   std::unordered_map<uint32_t, uint32_t> material_to_emitter_profile;
   std::unordered_map<uint32_t, uint32_t> gltf_image_mapping;
+  std::unordered_map<int32_t, uint32_t> gltf_material_mapping;
 
   uint32_t add_spectrum(const char* source_id, const SpectralDistribution& spd) {
     ETX_CRITICAL((source_id != nullptr) && (source_id[0] != 0));
@@ -106,6 +108,14 @@ struct SceneData {
     uint32_t index = static_cast<uint32_t>(materials.size());
     materials.emplace_back();
     material_mapping[id] = index;
+    return index;
+  }
+
+  uint32_t add_mesh(const char* name, uint32_t triangle_offset, uint32_t triangle_count) {
+    uint32_t index = static_cast<uint32_t>(meshes.size());
+    meshes.emplace_back(Mesh{triangle_offset, triangle_count});
+    std::string mesh_name = name && name[0] ? name : ("mesh-" + std::to_string(index));
+    mesh_mapping[mesh_name] = index;
     return index;
   }
 };

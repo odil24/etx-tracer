@@ -48,6 +48,9 @@ struct SceneSerialization {
   void parse_material_definitions(const char* base_dir, const std::vector<MaterialDefinition>& materials, SceneData& data, SceneLoaderContext& context, Scene& scene,
     const IORDatabase& database, TaskScheduler& scheduler);
 
+  bool parse_materials_file(const std::filesystem::path& path, const char* base_dir, SceneData& data, SceneLoaderContext& context, Scene& scene, const IORDatabase& database,
+    TaskScheduler& scheduler);
+
  private:
   ETX_DECLARE_PIMPL(SceneSerialization, 4096);
 };

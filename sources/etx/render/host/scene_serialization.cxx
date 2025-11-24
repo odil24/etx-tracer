@@ -1056,7 +1056,10 @@ struct SceneSerializationImpl {
 
       if (key == "newmtl") {
         std::string material_name;
-        iss >> material_name;
+        std::getline(iss, material_name);
+        if (!material_name.empty() && material_name[0] == ' ') {
+          material_name.erase(0, 1);
+        }
         materials.push_back({material_name, {}});
         current_material = &materials.back();
       } else if (current_material) {
@@ -2150,6 +2153,11 @@ bool SceneSerialization::save_to_file(const SceneData& data, const std::filesyst
 bool SceneSerialization::load_from_file(const std::filesystem::path& path, SceneData& data, const char* materials_file, SceneLoaderContext& context, Scene& scene,
   const IORDatabase& database, TaskScheduler& scheduler) {
   return _private->load_from_file(path, data, materials_file, context, scene, database, scheduler);
+}
+
+bool SceneSerialization::parse_materials_file(const std::filesystem::path& path, const char* base_dir, SceneData& data, SceneLoaderContext& context, Scene& scene,
+  const IORDatabase& database, TaskScheduler& scheduler) {
+  return _private->parse_materials_file(path, base_dir, data, context, scene, database, scheduler);
 }
 
 }  // namespace etx

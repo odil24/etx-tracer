@@ -17,8 +17,3 @@ else()
   add_library(bcdec INTERFACE bcdec.h)
   target_include_directories(bcdec INTERFACE ${CMAKE_CURRENT_LIST_DIR})
 endif()
-
-# Optionally build test executable
-if(BCDEC_BUILD_TESTS)
-  add_executable(bcdec_test "bcdec.h" "test.c")
-endif()

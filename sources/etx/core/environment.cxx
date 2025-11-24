@@ -150,6 +150,11 @@ uint64_t get_file_folder(const char* file_name, char buffer[], uint64_t buffer_s
   return 1ll + len;
 }
 
+void get_base_directory(const char* file_path, char* buffer, size_t buffer_size) {
+  memset(buffer, 0, buffer_size);
+  get_file_folder(file_path, buffer, buffer_size);
+}
+
 const char* get_file_ext(const char* file_name) {
   uint64_t fn_len = file_name ? strlen(file_name) : 0;
   while (fn_len > 0) {

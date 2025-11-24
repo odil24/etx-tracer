@@ -1017,6 +1017,14 @@ ETX_GPU_CODE float2 direction_to_uv(const float3& dir, const float2& offset, flo
   return {u, v};
 }
 
+ETX_GPU_CODE float quaternion_to_yaw_rotation_offset(const float4& quat) {
+  if ((quat.x == 0.0f) && (quat.y == 0.0f) && (quat.z == 0.0f) && (quat.w == 1.0f)) {
+    return 0.0f;
+  }
+  float yaw = atan2f(2.0f * (quat.w * quat.y + quat.x * quat.z), 1.0f - 2.0f * (quat.y * quat.y + quat.z * quat.z));
+  return -yaw / kDoublePi;
+}
+
 ETX_GPU_CODE uint64_t next_power_of_two(uint64_t v) {
   v--;
   v |= v >> 1llu;

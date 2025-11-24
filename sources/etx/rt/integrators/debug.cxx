@@ -33,6 +33,8 @@ struct CPUDebugIntegratorImpl : public Task {
     Bitangents,
     TexCoords,
     FaceOrientation,
+    NormalMap,
+    NormalMapApplied,
     TransmittanceColor,
     ReflectanceColor,
     Fresnel,
@@ -532,6 +534,29 @@ struct CPUDebugIntegratorImpl : public Task {
             output = d * (entering_material ? float3{0.2f, 0.2f, 1.0f} : float3{1.0f, 0.2f, 0.2f});
             break;
           };
+          case Mode::NormalMap: {
+            const auto& mat = scene.materials[intersection.material_index];
+            if ((mat.normal_image_index != kInvalidIndex) && (mat.normal_scale > kEpsilon)) {
+              auto sampled_normal = scene.images[mat.normal_image_index].evaluate_normal(intersection.tex, mat.normal_scale);
+              output = saturate(sampled_normal * 0.5f + 0.5f);
+            } else {
+              output = {0.5f, 0.5f, 1.0f};
+            }
+            break;
+          };
+          case Mode::NormalMapApplied: {
+            const auto& tri = scene.triangles[intersection.triangle_index];
+            float3 base_nrm = lerp_normal(scene.vertices, tri, intersection.barycentric);
+            float3 base_tan = lerp_tangent(scene.vertices, tri, intersection.barycentric);
+            float3 base_btn = lerp_bitangent(scene.vertices, tri, intersection.barycentric);
+            const auto& mat = scene.materials[intersection.material_index];
+            if ((mat.normal_image_index != kInvalidIndex) && (mat.normal_scale > kEpsilon)) {
+              auto sampled_normal = scene.images[mat.normal_image_index].evaluate_normal(intersection.tex, mat.normal_scale);
+              base_nrm = normalize(base_tan * sampled_normal.x + base_btn * sampled_normal.y + base_nrm * sampled_normal.z);
+            }
+            output = saturate(base_nrm * 0.5f + 0.5f);
+            break;
+          };
           case Mode::TransmittanceColor: {
             const auto& mat = scene.materials[intersection.material_index];
             output = apply_image(spect, mat.scattering, intersection.tex, rt.scene(), nullptr).to_rgb();
@@ -699,6 +724,10 @@ std::string CPUDebugIntegratorImpl::mode_to_string(uint32_t i) {
       return "Texture Coordinates";
     case Mode::FaceOrientation:
       return "Face Orientation";
+    case Mode::NormalMap:
+      return "Normal Map (Tangent Space)";
+    case Mode::NormalMapApplied:
+      return "Normal Map Applied";
     case Mode::TransmittanceColor:
       return "Transmittance Colors";
     case Mode::ReflectanceColor:

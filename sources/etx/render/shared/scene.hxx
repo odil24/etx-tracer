@@ -61,6 +61,8 @@ struct ETX_ALIGNED Scene {
   EnvironmentEmitters environment_emitters ETX_EMPTY_INIT;
   float3 bounding_sphere_center ETX_EMPTY_INIT;
   float bounding_sphere_radius ETX_EMPTY_INIT;
+  float3 bounding_box_min ETX_EMPTY_INIT;
+  float3 bounding_box_max ETX_EMPTY_INIT;
   PixelFilter pixel_sampler ETX_EMPTY_INIT;
   uint32_t min_path_length ETX_INIT_WITH(0u);
   uint32_t max_path_length ETX_INIT_WITH(65535u);
@@ -75,6 +77,7 @@ struct ETX_ALIGNED Scene {
   uint32_t ozone_spectrum = kInvalidIndex;
   uint32_t subsurface_scatter_material = kInvalidIndex;
   uint32_t subsurface_exit_material = kInvalidIndex;
+  uint32_t missing_material = kInvalidIndex;
   uint32_t default_dielectric_eta = kInvalidIndex;
   uint32_t default_conductor_eta = kInvalidIndex;
   uint32_t default_conductor_k = kInvalidIndex;

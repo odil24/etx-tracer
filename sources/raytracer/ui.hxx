@@ -72,6 +72,7 @@ struct UI {
     std::function<void(uint32_t)> medium_changed;
     std::function<void(uint32_t, uint32_t)> mesh_material_changed;  // mesh_index, new_material_index
     std::function<void(uint32_t)> emitter_changed;
+    std::function<void(uint32_t)> emitter_added;  // 0=environment, 1=directional, 2=atmosphere
     std::function<void(bool)> camera_changed;
     std::function<void()> scene_settings_changed;
     std::function<void()> denoise_selected;

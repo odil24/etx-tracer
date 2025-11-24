@@ -19,6 +19,8 @@ struct ImagePool {
   uint32_t add_copy(const Image& img);
   uint32_t add_from_file(const std::string& path, uint32_t image_options, const float2& offset, const float2& scale);
   uint32_t add_from_data(const float4* data, const uint2& dimensions, uint32_t image_options, const float2& offset, const float2& scale);
+  uint32_t add_from_spherical_harmonics(const float3 sh_coeffs[9], const uint2& dimensions, uint32_t image_options, const float2& offset, const float2& scale);
+  uint32_t add_from_cubemap(const uint32_t cube_face_images[6], const uint2& dimensions, uint32_t image_options, const float2& offset, const float2& scale);
 
   void remove(uint32_t handle);
   void remove_all();
