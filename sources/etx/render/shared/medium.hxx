@@ -2,6 +2,7 @@
 
 #include <etx/render/shared/spectrum.hxx>
 #include <etx/render/shared/sampler.hxx>
+#include <etx/render/shared/density_grid.hxx>
 
 namespace etx {
 
@@ -35,15 +36,13 @@ struct ETX_ALIGNED Medium {
     }
   };
 
-  ArrayView<float> density = {};
+  DensityGrid grid = {};
   BoundingBox bounds = {};
   Class cls = Class::Homogeneous;
   uint16_t enable_explicit_connections = true;
   uint32_t absorption_index = kInvalidIndex;
   uint32_t scattering_index = kInvalidIndex;
   float phase_function_g = 0.0f;
-  float max_sigma = 0.0f;
-  uint3 dimensions = {};
 };
 
 }  // namespace etx

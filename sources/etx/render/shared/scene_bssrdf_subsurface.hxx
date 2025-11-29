@@ -37,7 +37,7 @@ ETX_GPU_CODE void remap_channel(float color, const float scattering_distances, f
   ETX_VALIDATE(scattering);
 }
 
-ETX_GPU_CODE void remap(float3 color, const float3& scattering_distances, float3& albedo, float3& extinction, float3& scattering) {
+ETX_GPU_CODE void remap(const float3& color, const float3& scattering_distances, float3& albedo, float3& extinction, float3& scattering) {
   remap_channel(color.x, scattering_distances.x, albedo.x, extinction.x, scattering.x);
   remap_channel(color.y, scattering_distances.y, albedo.y, extinction.y, scattering.y);
   remap_channel(color.z, scattering_distances.z, albedo.z, extinction.z, scattering.z);

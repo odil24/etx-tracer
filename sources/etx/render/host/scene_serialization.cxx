@@ -1343,12 +1343,94 @@ struct SceneSerializationImpl {
     Medium::Class cls = Medium::Class::Homogeneous;
 
     char tmp_buffer[2048] = {};
-
+    bool has_volume = false;
     if (get_param(material, "volume")) {
       if (strlen(_data_buffer) > 0) {
         snprintf(tmp_buffer, sizeof(tmp_buffer), "%s%s", base_dir, _data_buffer);
         cls = Medium::Class::Heterogeneous;
+        has_volume = true;
       }
+    }
+
+    if (get_param(material, "noise")) {
+      char buffer[kDataBufferSize] = {};
+      memcpy(buffer, _data_buffer, kDataBufferSize);
+      auto params = split_params(buffer);
+
+      DensityGrid::NoiseFunction noise_type = DensityGrid::NoiseFunction::Perlin;
+      float noise_scale = 1.0f;
+      uint32_t noise_octaves = 1u;
+      float noise_lacunarity = 2.0f;
+      float noise_persistence = 0.5f;
+      uint32_t noise_seed = 0u;
+      float noise_power = 1.0f;
+      float noise_sharpness = 1.0f;
+      float3 noise_offset = {};
+      uint32_t noise_border_fade = 0u;
+      float noise_border_fade_distance = 0.1f;
+
+      for (uint64_t i = 0, e = params.size(); i < e; ++i) {
+        if ((strcmp(params[i], "type") == 0) && (i + 1 < e)) {
+          uint32_t val = 0u;
+          if (sscanf(params[i + 1], "%u", &val) == 1) {
+            uint32_t max_noise_type = static_cast<uint32_t>(DensityGrid::NoiseFunction::Lattice);
+            noise_type = static_cast<DensityGrid::NoiseFunction>(min(val, max_noise_type));
+          }
+          i += 1;
+        } else if ((strcmp(params[i], "scale") == 0) && (i + 1 < e)) {
+          noise_scale = static_cast<float>(atof(params[i + 1]));
+          i += 1;
+        } else if ((strcmp(params[i], "octaves") == 0) && (i + 1 < e)) {
+          noise_octaves = static_cast<uint32_t>(atoi(params[i + 1]));
+          i += 1;
+        } else if ((strcmp(params[i], "lacunarity") == 0) && (i + 1 < e)) {
+          noise_lacunarity = static_cast<float>(atof(params[i + 1]));
+          i += 1;
+        } else if ((strcmp(params[i], "persistence") == 0) && (i + 1 < e)) {
+          noise_persistence = static_cast<float>(atof(params[i + 1]));
+          i += 1;
+        } else if ((strcmp(params[i], "seed") == 0) && (i + 1 < e)) {
+          noise_seed = static_cast<uint32_t>(atoi(params[i + 1]));
+          i += 1;
+        } else if ((strcmp(params[i], "power") == 0) && (i + 1 < e)) {
+          noise_power = static_cast<float>(atof(params[i + 1]));
+          i += 1;
+        } else if ((strcmp(params[i], "sharpness") == 0) && (i + 1 < e)) {
+          noise_sharpness = static_cast<float>(atof(params[i + 1]));
+          i += 1;
+        } else if ((strcmp(params[i], "offset") == 0) && (i + 3 < e)) {
+          noise_offset = {
+            static_cast<float>(atof(params[i + 1])),
+            static_cast<float>(atof(params[i + 2])),
+            static_cast<float>(atof(params[i + 3])),
+          };
+          i += 3;
+        } else if ((strcmp(params[i], "border_fade") == 0) && (i + 1 < e)) {
+          noise_border_fade = static_cast<uint32_t>(atoi(params[i + 1]));
+          i += 1;
+        } else if ((strcmp(params[i], "border_fade_distance") == 0) && (i + 1 < e)) {
+          noise_border_fade_distance = static_cast<float>(atof(params[i + 1]));
+          i += 1;
+        }
+      }
+
+      auto select_index = [&](const SpectralDistribution& spd, uint32_t fallback) {
+        if (spd.spectral_entry_count == 0) {
+          return fallback;
+        }
+        return data.add_spectrum(spd);
+      };
+
+      uint32_t absorption_index = select_index(s_a, scene.black_spectrum);
+      uint32_t scattering_index = select_index(s_t, scene.black_spectrum);
+
+      uint32_t medium_handle = context.mediums.add_noise(Medium::Class::Heterogeneous, name, noise_type, absorption_index, scattering_index, anisotropy, explicit_connections,
+        noise_scale, noise_octaves, noise_lacunarity, noise_persistence, noise_seed, noise_power, noise_offset);
+      Medium& medium = context.mediums.get(medium_handle);
+      medium.grid.noise.sharpness = noise_sharpness;
+      medium.grid.noise.enable_border_fade = noise_border_fade;
+      medium.grid.noise.border_fade_distance = noise_border_fade_distance;
+      return;
     }
 
     context.add_medium(scene, data, cls, name.c_str(), tmp_buffer, s_a, s_t, anisotropy, explicit_connections);

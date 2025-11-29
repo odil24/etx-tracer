@@ -467,6 +467,7 @@ struct SceneRepresentationImpl {
   TriangleEmitterData compute_triangle_emitter_data(uint32_t triangle_index);
   void populate_area_emitters();
   void rebuild_area_emitters();
+  void update_medium_bounds();
   void set_mesh_material(uint32_t mesh_index, uint32_t material_index);
 
   void set_mesh_material_impl(uint32_t mesh_index, uint32_t material_index);
@@ -1044,6 +1045,7 @@ bool SceneRepresentation::load_from_file(const char* filename, uint32_t options,
     log::warning("Tangents validated: %.2f sec", m.lap());
   }
 
+  _private->update_medium_bounds();
   _private->commit(spectral_scene);
 
   if (needs_camera_positioning) {
@@ -1223,6 +1225,57 @@ void SceneRepresentationImpl::populate_area_emitters() {
   });
 }
 
+void SceneRepresentationImpl::update_medium_bounds() {
+  if (data.triangles.empty() || data.vertices.pos.empty()) {
+    return;
+  }
+
+  std::unordered_map<uint32_t, std::pair<float3, float3>> medium_bounds_map;
+
+  for (const auto& tri : data.triangles) {
+    if (tri.material_index >= data.materials.size()) {
+      continue;
+    }
+
+    const auto& material = data.materials[tri.material_index];
+    const float3& v0 = data.vertices.pos[tri.i[0]];
+    const float3& v1 = data.vertices.pos[tri.i[1]];
+    const float3& v2 = data.vertices.pos[tri.i[2]];
+
+    float3 tri_min = min(min(v0, v1), v2);
+    float3 tri_max = max(max(v0, v1), v2);
+
+    if (material.int_medium != kInvalidIndex) {
+      auto& bounds = medium_bounds_map[material.int_medium];
+      if (bounds.first.x == kMaxFloat) {
+        bounds.first = tri_min;
+        bounds.second = tri_max;
+      } else {
+        bounds.first = min(bounds.first, tri_min);
+        bounds.second = max(bounds.second, tri_max);
+      }
+    }
+
+    if (material.ext_medium != kInvalidIndex) {
+      auto& bounds = medium_bounds_map[material.ext_medium];
+      if (bounds.first.x == kMaxFloat) {
+        bounds.first = tri_min;
+        bounds.second = tri_max;
+      } else {
+        bounds.first = min(bounds.first, tri_min);
+        bounds.second = max(bounds.second, tri_max);
+      }
+    }
+  }
+
+  for (const auto& [medium_index, bounds_pair] : medium_bounds_map) {
+    if (medium_index < context.mediums.array_size()) {
+      Medium& medium = context.mediums.get(medium_index);
+      medium.bounds = {bounds_pair.first, 0.0f, bounds_pair.second, 0.0f};
+    }
+  }
+}
+
 void SceneRepresentationImpl::rebuild_area_emitters() {
   populate_area_emitters();
   scene.triangle_to_emitter = {data.triangle_to_emitter.data(), data.triangle_to_emitter.size()};
@@ -1348,8 +1401,6 @@ uint32_t SceneRepresentationImpl::load_from_obj(const char* file_name, const cha
 
   for (const auto& shape : obj_shapes) {
     uint64_t index_offset = 0;
-    float3 shape_bbox_min = {kMaxFloat, kMaxFloat, kMaxFloat};
-    float3 shape_bbox_max = {-kMaxFloat, -kMaxFloat, -kMaxFloat};
 
     // Determine material for this shape
     uint32_t shape_material_index = scene.missing_material;
@@ -1448,19 +1499,6 @@ uint32_t SceneRepresentationImpl::load_from_obj(const char* file_name, const cha
         range.first = triangle_index;  // offset
       }
       range.second++;  // count
-
-      // TODO : deal with bounds!
-      shape_bbox_max = max(shape_bbox_max, vertices.pos[tri.i[0]]);
-      shape_bbox_max = max(shape_bbox_max, vertices.pos[tri.i[1]]);
-      shape_bbox_max = max(shape_bbox_max, vertices.pos[tri.i[2]]);
-      shape_bbox_min = min(shape_bbox_min, vertices.pos[tri.i[0]]);
-      shape_bbox_min = min(shape_bbox_min, vertices.pos[tri.i[1]]);
-      shape_bbox_min = min(shape_bbox_min, vertices.pos[tri.i[2]]);
-
-      auto& mtl = data.materials[tri.material_index];
-      if (mtl.int_medium != kInvalidIndex) {
-        context.mediums.get(mtl.int_medium).bounds = {shape_bbox_min, 0.0f, shape_bbox_max, 0.0f};
-      }
     }
 
     // Create meshes for this shape, grouped by material
@@ -1475,7 +1513,20 @@ uint32_t SceneRepresentationImpl::load_from_obj(const char* file_name, const cha
         mesh_name += "_" + std::to_string(material_counter++);
       }
 
-      data.add_mesh(mesh_name.c_str(), triangle_range.first, triangle_range.second);
+      // Compute bbox for this mesh
+      float3 mesh_bbox_min = {kMaxFloat, kMaxFloat, kMaxFloat};
+      float3 mesh_bbox_max = {-kMaxFloat, -kMaxFloat, -kMaxFloat};
+      for (uint32_t i = 0; i < triangle_range.second; ++i) {
+        const auto& tri = triangles[triangle_range.first + i];
+        mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[0]]);
+        mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[1]]);
+        mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[2]]);
+        mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[0]]);
+        mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[1]]);
+        mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[2]]);
+      }
+
+      data.add_mesh(mesh_name.c_str(), triangle_range.first, triangle_range.second, mesh_bbox_min, mesh_bbox_max);
     }
 
     // Log material assignment result for this shape
@@ -2118,6 +2169,8 @@ void SceneRepresentationImpl::load_gltf_mesh(const tinygltf::Node& node, const t
     }
 
     uint32_t triangle_start = static_cast<uint32_t>(triangles.size());
+    float3 mesh_bbox_min = {kMaxFloat, kMaxFloat, kMaxFloat};
+    float3 mesh_bbox_max = {-kMaxFloat, -kMaxFloat, -kMaxFloat};
 
     const tinygltf::Accessor& pos_accessor = model.accessors[primitive.attributes.find("POSITION")->second];
     const tinygltf::BufferView& pos_buffer_view = model.bufferViews[pos_accessor.bufferView];
@@ -2285,6 +2338,13 @@ void SceneRepresentationImpl::load_gltf_mesh(const tinygltf::Node& node, const t
         continue;
       }
 
+      mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[0]]);
+      mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[1]]);
+      mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[2]]);
+      mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[0]]);
+      mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[1]]);
+      mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[2]]);
+
       if (has_normals == false) {
         vertices.nrm[vertices.nrm.size() - 1u] = tri.geo_n;
         vertices.nrm[vertices.nrm.size() - 2u] = tri.geo_n;
@@ -2307,7 +2367,7 @@ void SceneRepresentationImpl::load_gltf_mesh(const tinygltf::Node& node, const t
       } else {
         mesh_name = "mesh_" + std::to_string(primitive_index);
       }
-      data.add_mesh(mesh_name.c_str(), triangle_start, triangle_count);
+      data.add_mesh(mesh_name.c_str(), triangle_start, triangle_count, mesh_bbox_min, mesh_bbox_max);
     }
   }
 }
@@ -2726,6 +2786,13 @@ std::string SceneRepresentation::save_to_file(const char* filename, Integrator::
     }
     if (medium.enable_explicit_connections == false) {
       materials_stream << "enclosed 1\n";
+    }
+    if (medium.grid.type == DensityGrid::Type::NoiseFunction) {
+      materials_stream << "noise type " << static_cast<uint32_t>(medium.grid.noise_type) << " scale " << medium.grid.noise.scale << " octaves " << medium.grid.noise.octaves
+                       << " lacunarity " << medium.grid.noise.lacunarity << " persistence " << medium.grid.noise.persistence << " seed " << medium.grid.noise.seed << " power "
+                       << medium.grid.noise.power << " sharpness " << medium.grid.noise.sharpness << " offset " << medium.grid.noise.offset.x << " " << medium.grid.noise.offset.y
+                       << " " << medium.grid.noise.offset.z << " border_fade " << medium.grid.noise.enable_border_fade << " border_fade_distance "
+                       << medium.grid.noise.border_fade_distance << "\n";
     }
     materials_stream << "\n";
   }

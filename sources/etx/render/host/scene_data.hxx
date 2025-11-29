@@ -111,9 +111,13 @@ struct SceneData {
     return index;
   }
 
-  uint32_t add_mesh(const char* name, uint32_t triangle_offset, uint32_t triangle_count) {
+  uint32_t add_mesh(const char* name, uint32_t triangle_offset, uint32_t triangle_count, const float3& bbox_min, const float3& bbox_max) {
     uint32_t index = static_cast<uint32_t>(meshes.size());
-    meshes.emplace_back(Mesh{triangle_offset, triangle_count});
+    auto& mesh = meshes.emplace_back();
+    mesh.triangle_offset = triangle_offset;
+    mesh.triangle_count = triangle_count;
+    mesh.bbox_min = bbox_min;
+    mesh.bbox_max = bbox_max;
     std::string mesh_name = name && name[0] ? name : ("mesh-" + std::to_string(index));
     mesh_mapping[mesh_name] = index;
     return index;
@@ -162,16 +166,8 @@ struct SceneLoaderContext {
     uint32_t absorption_index = select_index(s_a, scene.black_spectrum);
     uint32_t scattering_index = select_index(s_t, scene.black_spectrum);
 
-    float max_sigma = 0.0f;
-    if ((absorption_index != kInvalidIndex) && (absorption_index < data.spectrum_values.size())) {
-      max_sigma += data.spectrum_values[absorption_index].maximum_spectral_power();
-    }
-    if ((scattering_index != kInvalidIndex) && (scattering_index < data.spectrum_values.size())) {
-      max_sigma += data.spectrum_values[scattering_index].maximum_spectral_power();
-    }
-
     std::string id = name && name[0] ? name : ("medium-" + std::to_string(mediums.array_size()));
-    return mediums.add(cls, id, volume_file, absorption_index, scattering_index, max_sigma, g, explicit_connections);
+    return mediums.add(cls, id, volume_file, absorption_index, scattering_index, g, explicit_connections);
   }
 };
 

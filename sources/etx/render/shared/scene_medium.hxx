@@ -30,8 +30,9 @@ ETX_GPU_CODE bool medium_bounds(const Medium& medium, const float3& in_pos, cons
     t_far *= g3;
 
     t_min = t_near > t_min ? t_near : t_min;
+    ETX_CHECK_FINITE(t_min);
     t_max = t_far < t_max ? t_far : t_max;
-
+    ETX_CHECK_FINITE(t_max);
     if (t_min > t_max)
       return false;
   }
@@ -39,59 +40,28 @@ ETX_GPU_CODE bool medium_bounds(const Medium& medium, const float3& in_pos, cons
   return true;
 }
 
-ETX_GPU_CODE bool medium_intersects_bounds(const Medium& medium, const float3& in_pos, const float3& in_direction, float in_max_t, float3& medium_pos, float3& medium_dir,
-  float& t_min, float& t_max) {
+ETX_GPU_CODE bool medium_intersects_bounds(const Medium& medium, const float3& in_pos, const float3& in_direction, const float in_max_t, float3& medium_pos, float3& medium_dir,
+  float& t_min, float& t_max, float3& world_dir_normalized, float3& bbox_size) {
   if (in_max_t >= kMaxFloat) {
     return false;
   }
 
   float3 end_pos = in_pos + in_direction * in_max_t;
+  ETX_CHECK_FINITE(end_pos);
   float3 medium_end_pos = medium.bounds.to_local(end_pos);
+  ETX_CHECK_FINITE(medium_end_pos);
 
   medium_pos = medium.bounds.to_local(in_pos);
+  ETX_CHECK_FINITE(medium_pos);
   medium_dir = normalize(medium_end_pos - medium_pos);
+  ETX_CHECK_FINITE(medium_dir);
+
+  world_dir_normalized = normalize(in_direction);
+  bbox_size = medium.bounds.p_max - medium.bounds.p_min;
+
   float segment = length(medium_end_pos - medium_pos);
-
+  ETX_CHECK_FINITE(segment);
   return medium_bounds(medium, medium_pos, medium_dir, segment, t_min, t_max);
-}
-
-ETX_GPU_CODE float medium_sample_density_internal(const Medium& medium, const float3& coord) {
-  ETX_ASSERT(medium.cls == Medium::Class::Heterogeneous);
-
-  if ((coord.x < 0.0f) || (coord.y < 0.0f) || (coord.z < 0.0f) || (coord.x >= 1.0f) || (coord.y >= 1.0f) || (coord.z >= 1.0f)) {
-    return 0.0f;
-  }
-
-  float px = clamp(coord.x * float(medium.dimensions.x) - 0.5f, 0.0f, float(medium.dimensions.x) - 1.0f);
-  float py = clamp(coord.y * float(medium.dimensions.y) - 0.5f, 0.0f, float(medium.dimensions.y) - 1.0f);
-  float pz = clamp(coord.z * float(medium.dimensions.z) - 0.5f, 0.0f, float(medium.dimensions.z) - 1.0f);
-
-  uint32_t ix = min(medium.dimensions.x - 1u, static_cast<uint32_t>(px));
-  uint32_t nx = min(medium.dimensions.x - 1u, ix + 1u);
-
-  uint32_t iy = min(medium.dimensions.y - 1u, static_cast<uint32_t>(py));
-  uint32_t ny = min(medium.dimensions.y - 1u, iy + 1u);
-
-  uint32_t iz = min(medium.dimensions.z - 1u, static_cast<uint32_t>(pz));
-  uint32_t nz = min(medium.dimensions.z - 1u, iz + 1u);
-
-  auto density = medium.density;
-  float d000 = density[ix + iy * medium.dimensions.x + iz * medium.dimensions.x * medium.dimensions.y];
-  float d001 = density[nx + iy * medium.dimensions.x + iz * medium.dimensions.x * medium.dimensions.y];
-  float d010 = density[ix + ny * medium.dimensions.x + iz * medium.dimensions.x * medium.dimensions.y];
-  float d011 = density[nx + ny * medium.dimensions.x + iz * medium.dimensions.x * medium.dimensions.y];
-  float d100 = density[ix + iy * medium.dimensions.x + nz * medium.dimensions.x * medium.dimensions.y];
-  float d101 = density[nx + iy * medium.dimensions.x + nz * medium.dimensions.x * medium.dimensions.y];
-  float d110 = density[ix + ny * medium.dimensions.x + nz * medium.dimensions.x * medium.dimensions.y];
-  float d111 = density[nx + ny * medium.dimensions.x + nz * medium.dimensions.x * medium.dimensions.y];
-
-  float dx = px - floorf(px);
-  float dy = py - floorf(py);
-  float dz = pz - floorf(pz);
-
-  float d_bottom = lerp(lerp(d000, d001, dx), lerp(d010, d011, dx), dy);
-  float d_top = lerp(lerp(d100, d101, dx), lerp(d110, d111, dx), dy);
-  return lerp(d_bottom, d_top, dz);
 }
 
 }  // namespace
@@ -195,7 +165,9 @@ ETX_GPU_CODE SpectralResponse medium_transmittance(const Scene& scene, const Med
       return exp(medium_extinction(scene, medium, spect) * (-distance));
 
     case Medium::Class::Heterogeneous: {
-      if (medium.max_sigma <= 0.0f) {
+      SpectralResponse base_extinction = medium_extinction(scene, medium, spect);
+      float max_sigma = base_extinction.maximum();
+      if (max_sigma <= 0.0f) {
         return {spect, 1.0f};
       }
 
@@ -203,33 +175,41 @@ ETX_GPU_CODE SpectralResponse medium_transmittance(const Scene& scene, const Med
       float3 medium_dir = direction;
       float t_min = 0.0f;
       float t_max = 0.0f;
-      if (medium_intersects_bounds(medium, pos, direction, distance, medium_pos, medium_dir, t_min, t_max) == false) {
+      float3 world_dir_normalized = {};
+      float3 bbox_size = {};
+      if (medium_intersects_bounds(medium, pos, direction, distance, medium_pos, medium_dir, t_min, t_max, world_dir_normalized, bbox_size) == false) {
         return {spect, 1.0f};
       }
-
       const float rr_threshold = 0.1f;
-      float transmittance = 1.0f;
+      SpectralResponse transmittance = {spect, 1.0f};
 
-      float t = t_min;
+      float t_world = 0.0f;
       while (true) {
-        t -= logf(1.0f - smp.next()) / medium.max_sigma;
-        if (t >= t_max) {
+        t_world += -logf(1.0f - smp.next()) / max_sigma;
+        float3 world_pos_at_t = pos + world_dir_normalized * t_world;
+        float3 local_pos = medium.bounds.to_local(world_pos_at_t);
+        float t_local_along_dir = dot(local_pos - medium_pos, medium_dir);
+        if (t_local_along_dir >= (t_max - t_min)) {
           break;
         }
 
-        float density_value = medium_sample_density_internal(medium, medium_pos + medium_dir * t);
-        transmittance *= max(0.0f, 1.0f - density_value);
+        float density_value = medium.grid.sample(local_pos, medium.bounds);
+        SpectralResponse extinction_at_point = base_extinction * density_value;
+        SpectralResponse weight = SpectralResponse{spect, 1.0f} - extinction_at_point / max_sigma;
+        transmittance *= max(0.0f, weight);
+        ETX_VALIDATE(transmittance);
 
-        if (transmittance < rr_threshold) {
-          float q = max(0.05f, 1.0f - transmittance);
+        float transmittance_max = transmittance.maximum();
+        if (transmittance_max < rr_threshold) {
+          float q = max(0.05f, 0.95f);
           if (smp.next() < q) {
             return {spect, 0.0f};
           }
-          transmittance /= (1.0f - q);
+          transmittance *= (1.0f / (1.0f - q));
+          ETX_VALIDATE(transmittance);
         }
       }
-
-      return {spect, transmittance};
+      return transmittance;
     }
 
     default:
@@ -283,7 +263,10 @@ ETX_GPU_CODE Medium::Sample sample_medium(const Scene& scene, const Medium& medi
 
     case Medium::Class::Heterogeneous: {
       Medium::Sample result = {};
-      if (medium.max_sigma <= 0.0f) {
+
+      SpectralResponse base_extinction = medium_extinction(scene, medium, spect);
+      float max_sigma = base_extinction.maximum();
+      if (max_sigma <= 0.0f) {
         return result;
       }
 
@@ -291,57 +274,83 @@ ETX_GPU_CODE Medium::Sample sample_medium(const Scene& scene, const Medium& medi
       float3 medium_dir = w_i;
       float t_min = 0.0f;
       float t_max = 0.0f;
-      if (medium_intersects_bounds(medium, pos, w_i, max_t, medium_pos, medium_dir, t_min, t_max) == false) {
+      float3 world_dir_normalized = {};
+      float3 bbox_size = {};
+      if (medium_intersects_bounds(medium, pos, w_i, max_t, medium_pos, medium_dir, t_min, t_max, world_dir_normalized, bbox_size) == false) {
         return result;
       }
 
       SpectralResponse scattering_value = medium_scattering(scene, medium, spect);
-      SpectralResponse extinction_value = medium_extinction(scene, medium, spect);
-      SpectralResponse albedo = calculate_albedo(spect, scattering_value, extinction_value);
 
-      float t = t_min;
-      float previous_t = t_min;
-      SpectralResponse accumulated_transmittance = {spect, 1.0f};
+      float t_world = 0.0f;
+      float previous_t_world = 0.0f;
+      SpectralResponse transmittance_exp = {spect, 1.0f};
+      SpectralResponse transmittance_ratio = {spect, 1.0f};
 
       while (true) {
-        t -= logf(1.0f - smp.next()) / medium.max_sigma;
-        if (t >= t_max) {
+        t_world += -logf(1.0f - smp.next()) / max_sigma;
+        float3 world_pos_at_t = pos + world_dir_normalized * t_world;
+        float3 local_pos = medium.bounds.to_local(world_pos_at_t);
+        float t_local_along_dir = dot(local_pos - medium_pos, medium_dir);
+        if (t_local_along_dir >= (t_max - t_min)) {
           break;
         }
 
-        float distance = max(0.0f, t - previous_t);
-        accumulated_transmittance *= exp(-extinction_value * distance);
-        ETX_VALIDATE(accumulated_transmittance);
-        previous_t = t;
+        float distance_world = max(0.0f, t_world - previous_t_world);
+        float density_value = medium.grid.sample(local_pos, medium.bounds);
+        SpectralResponse extinction_at_point = base_extinction * density_value;
+        transmittance_exp *= exp(-extinction_at_point * distance_world);
+        ETX_VALIDATE(transmittance_exp);
 
-        float density_value = medium_sample_density_internal(medium, medium_pos + medium_dir * t);
-        if (density_value * medium.max_sigma == 0.0f) {
+        SpectralResponse weight_ratio = SpectralResponse{spect, 1.0f} - extinction_at_point / max_sigma;
+        weight_ratio = min(max(weight_ratio, 0.0f), 1.0f);
+        transmittance_ratio *= weight_ratio;
+        ETX_VALIDATE(transmittance_ratio);
+
+        const float rr_threshold = 0.1f;
+        float trans_max = transmittance_ratio.maximum();
+        if (trans_max < rr_threshold) {
+          float q = max(0.05f, 0.95f);
+          if (smp.next() < q) {
+            transmittance_exp = {spect, 0.0f};
+            transmittance_ratio = {spect, 0.0f};
+            break;
+          }
+          SpectralResponse scale = SpectralResponse{spect, 1.0f / (1.0f - q)};
+          transmittance_exp *= scale;
+          transmittance_ratio *= scale;
+          ETX_VALIDATE(transmittance_exp);
+          ETX_VALIDATE(transmittance_ratio);
+        }
+
+        previous_t_world = t_world;
+
+        if (density_value * max_sigma == 0.0f) {
           continue;
         }
 
+        SpectralResponse scattering_at_point = scattering_value * density_value;
+        SpectralResponse albedo_at_point = calculate_albedo(spect, scattering_at_point, extinction_at_point);
+
         SpectralResponse pdf = {};
-        uint32_t channel = sample_spectrum_component(spect, albedo, scattering_value, smp.next(), pdf);
-        float sigma_t = extinction_value.component(channel);
+        uint32_t channel = sample_spectrum_component(spect, albedo_at_point, scattering_at_point, smp.next(), pdf);
+        float sigma_t = extinction_at_point.component(channel);
+        float accept_prob = (max_sigma > 0.0f) ? (sigma_t / max_sigma) : 0.0f;
+        accept_prob = clamp(accept_prob, 0.0f, 1.0f);
 
         float random = smp.next();
-        if ((sigma_t > 0.0f) && (random < density_value)) {
-          float pdf_sum = pdf.sum();
-          if (pdf_sum > 0.0f) {
-            result.weight = (scattering_value * accumulated_transmittance) / pdf_sum;
-          } else {
-            result.weight = scattering_value * accumulated_transmittance;
-          }
+        if ((sigma_t > 0.0f) && (random < accept_prob)) {
+          SpectralResponse pdf_delta = pdf * (transmittance_exp * extinction_at_point);
+          float pdf_sum = pdf_delta.sum();
+          result.weight = (scattering_at_point * transmittance_exp) / max(kEpsilon, pdf_sum);
           ETX_VALIDATE(result.weight);
-          result.pos = medium_pos + medium_dir * t;
-          result.sampled_medium_t = t - t_min;
+          result.pos = medium.bounds.from_local(local_pos);
+          result.sampled_medium_t = t_world;
           return result;
         }
       }
-
-      float remaining_distance = max(0.0f, t_max - previous_t);
-      accumulated_transmittance *= exp(-extinction_value * remaining_distance);
-      ETX_VALIDATE(accumulated_transmittance);
-      result.weight = accumulated_transmittance;
+      result.weight = transmittance_ratio;
+      result.sampled_medium_t = 0.0f;
       return result;
     }
 

@@ -1349,12 +1349,42 @@ bool UI::build_medium(Scene& scene, Medium& m, const char* name) {
   ensure_index(m.absorption_index, scene.black_spectrum);
   ensure_index(m.scattering_index, scene.black_spectrum);
 
-  bool has_density_grid = m.density.count != 0;
+  bool has_density_grid = m.grid.has_data();
   bool recompute_extinction = false;
-  float updated_max_sigma = m.max_sigma;
 
   if (name != nullptr) {
     ImGui::Text("%s", name);
+  }
+
+  ImGui::Text("Medium Type");
+  const char* medium_type_names[] = {"Homogeneous", "Heterogeneous (Noise)"};
+  int32_t medium_type_idx = (m.cls == Medium::Class::Heterogeneous) ? 1 : 0;
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+  if (ImGui::Combo("##medium_type", &medium_type_idx, medium_type_names, 2)) {
+    if (medium_type_idx == 0) {
+      m.cls = Medium::Class::Homogeneous;
+      m.grid.type = DensityGrid::Type::Texture3D;
+      m.grid.density = {};
+      m.grid.dimensions = {};
+      changed = true;
+    } else {
+      m.cls = Medium::Class::Heterogeneous;
+      if (m.grid.type != DensityGrid::Type::NoiseFunction) {
+        m.grid.type = DensityGrid::Type::NoiseFunction;
+        m.grid.noise_type = DensityGrid::NoiseFunction::Perlin;
+        m.grid.noise.scale = 1.0f;
+        m.grid.noise.octaves = 1u;
+        m.grid.noise.lacunarity = 2.0f;
+        m.grid.noise.persistence = 0.5f;
+        m.grid.noise.seed = 0u;
+        m.grid.noise.power = 1.0f;
+        m.grid.noise.sharpness = 1.0f;
+        m.grid.noise.offset = {};
+        m.grid.noise.enable_border_fade = 0u;
+        m.grid.noise.border_fade_distance = 0.1f;
+        changed = true;
+      }
+    }
   }
 
   ImGui::Text("Absorption");
@@ -1371,16 +1401,6 @@ bool UI::build_medium(Scene& scene, Medium& m, const char* name) {
     recompute_extinction = true;
   }
 
-  if (recompute_extinction) {
-    updated_max_sigma = 0.0f;
-    if (m.absorption_index < scene.spectrums.count) {
-      updated_max_sigma += scene.spectrums[m.absorption_index].maximum_spectral_power();
-    }
-    if (m.scattering_index < scene.spectrums.count) {
-      updated_max_sigma += scene.spectrums[m.scattering_index].maximum_spectral_power();
-    }
-  }
-
   ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
   if (ImGui::SliderFloat("##medium_phase_g", &m.phase_function_g, -0.999f, 0.999f, "Anisotropy %.3f", ImGuiSliderFlags_AlwaysClamp)) {
     changed = true;
@@ -1392,15 +1412,67 @@ bool UI::build_medium(Scene& scene, Medium& m, const char* name) {
     changed = true;
   }
 
-  if (has_density_grid) {
-    ImGui::Text("Density grid");
-    ImGui::Text("%u x %u x %u", m.dimensions.x, m.dimensions.y, m.dimensions.z);
-    ImGui::Text("Bounds");
-    ImGui::Text("min (%.3f, %.3f, %.3f)  max (%.3f, %.3f, %.3f)", m.bounds.p_min.x, m.bounds.p_min.y, m.bounds.p_min.z, m.bounds.p_max.x, m.bounds.p_max.y, m.bounds.p_max.z);
-  }
-
-  if (changed) {
-    m.max_sigma = updated_max_sigma;
+  if (m.cls == Medium::Class::Heterogeneous) {
+    if (m.grid.type == DensityGrid::Type::Texture3D) {
+      ImGui::Text("Density grid (3D Texture)");
+      ImGui::Text("%u x %u x %u", m.grid.dimensions.x, m.grid.dimensions.y, m.grid.dimensions.z);
+      ImGui::Text("Bounds");
+      ImGui::Text("min (%.3f, %.3f, %.3f)  max (%.3f, %.3f, %.3f)", m.bounds.p_min.x, m.bounds.p_min.y, m.bounds.p_min.z, m.bounds.p_max.x, m.bounds.p_max.y, m.bounds.p_max.z);
+    } else if (m.grid.type == DensityGrid::Type::NoiseFunction) {
+      ImGui::Text("Density grid (Noise Function)");
+      ImGui::Text("Noise Type");
+      const char* noise_names[] = {"Perlin", "Worley", "Billow", "Voronoi", "Lattice"};
+      int32_t noise_idx = static_cast<int32_t>(m.grid.noise_type);
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::Combo("##medium_noise_type", &noise_idx, noise_names, 5)) {
+        m.grid.noise_type = static_cast<DensityGrid::NoiseFunction>(noise_idx);
+        changed = true;
+      }
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::SliderFloat("##medium_noise_scale", &m.grid.noise.scale, 0.01f, 100.0f, "Scale: %.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        changed = true;
+      }
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::SliderInt("##medium_noise_octaves", reinterpret_cast<int32_t*>(&m.grid.noise.octaves), 1, 16, "Octaves: %d", ImGuiSliderFlags_AlwaysClamp)) {
+        changed = true;
+      }
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::SliderFloat("##medium_noise_lacunarity", &m.grid.noise.lacunarity, 1.0f, 4.0f, "Lacunarity: %.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        changed = true;
+      }
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::SliderFloat("##medium_noise_persistence", &m.grid.noise.persistence, 0.01f, 1.0f, "Persistence: %.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        changed = true;
+      }
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::InputInt("##medium_noise_seed", reinterpret_cast<int32_t*>(&m.grid.noise.seed))) {
+        changed = true;
+      }
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::SliderFloat("##medium_noise_power", &m.grid.noise.power, 0.1f, 10.0f, "Power: %.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        changed = true;
+      }
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::SliderFloat("##medium_noise_sharpness", &m.grid.noise.sharpness, 0.1f, 10.0f, "Sharpness: %.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        changed = true;
+      }
+      ImGui::Text("Offset");
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      if (ImGui::DragFloat3("##medium_noise_offset", &m.grid.noise.offset.x, 0.1f, -100.0f, 100.0f, "%.2f")) {
+        changed = true;
+      }
+      bool border_fade_enabled = m.grid.noise.enable_border_fade != 0u;
+      if (ImGui::Checkbox("Border Fade", &border_fade_enabled)) {
+        m.grid.noise.enable_border_fade = border_fade_enabled ? 1u : 0u;
+        changed = true;
+      }
+      if (border_fade_enabled) {
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        if (ImGui::SliderFloat("##medium_noise_border_fade_distance", &m.grid.noise.border_fade_distance, 0.01f, 0.5f, "Fade Distance: %.3f", ImGuiSliderFlags_AlwaysClamp)) {
+          changed = true;
+        }
+      }
+    }
   }
 
   return changed;

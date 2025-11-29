@@ -20,8 +20,7 @@ struct MediumPoolImpl {
     mapping.clear();
   }
 
-  uint32_t add(Medium::Class cls, const std::string& id, const char* volume_file, uint32_t absorption_index, uint32_t scattering_index, float max_sigma, float g,
-    bool explicit_connections) {
+  uint32_t add(Medium::Class cls, const std::string& id, const char* volume_file, uint32_t absorption_index, uint32_t scattering_index, float g, bool explicit_connections) {
     auto existing = mapping.find(id);
     if (existing != mapping.end()) {
       return existing->second;
@@ -34,13 +33,14 @@ struct MediumPoolImpl {
     medium.cls = cls;
     medium.absorption_index = absorption_index;
     medium.scattering_index = scattering_index;
-    medium.max_sigma = max_sigma;
     medium.phase_function_g = g;
     medium.enable_explicit_connections = explicit_connections;
+    medium.bounds = BoundingBox{{-1.0f, -1.0f, -1.0f}, 0.0f, {1.0f, 1.0f, 1.0f}, 0.0f};
 
     if ((volume_file != nullptr) && (strlen(volume_file) > 0)) {
       float max_density = 0.0f;
-      auto density = load_density_grid(volume_file, medium.dimensions);
+      uint3 dimensions = {};
+      auto density = load_density_grid(volume_file, dimensions);
       for (auto f : density) {
         max_density = max(max_density, f);
       }
@@ -48,13 +48,17 @@ struct MediumPoolImpl {
         for (auto& f : density) {
           f /= max_density;
         }
-        medium.density.count = density.size();
-        medium.density.a = reinterpret_cast<float*>(malloc(medium.density.count * sizeof(float)));
-        memcpy(medium.density.a, density.data(), sizeof(float) * medium.density.count);
+        medium.grid.type = DensityGrid::Type::Texture3D;
+        medium.grid.density.count = density.size();
+        medium.grid.density.a = reinterpret_cast<float*>(malloc(medium.grid.density.count * sizeof(float)));
+        memcpy(medium.grid.density.a, density.data(), sizeof(float) * medium.grid.density.count);
+        medium.grid.dimensions = dimensions;
         medium.cls = Medium::Class::Heterogeneous;
       } else {
         medium.cls = Medium::Class::Homogeneous;
       }
+    } else {
+      medium.grid.type = DensityGrid::Type::Texture3D;
     }
 
     mapping[id] = handle;
@@ -80,8 +84,8 @@ struct MediumPoolImpl {
   }
 
   void free_medium(Medium& m) {
-    if (m.density.count > 0) {
-      free(m.density.a);
+    if (m.grid.density.count > 0) {
+      free(m.grid.density.a);
     }
     m = {};
   }
@@ -172,9 +176,45 @@ void MediumPool::cleanup() {
   _private->cleanup();
 }
 
-uint32_t MediumPool::add(Medium::Class cls, const std::string& id, const char* volume, uint32_t absorption_index, uint32_t scattering_index, float max_sigma, float g,
-  bool explicit_connections) {
-  return _private->add(cls, id, volume, absorption_index, scattering_index, max_sigma, g, explicit_connections);
+uint32_t MediumPool::add(Medium::Class cls, const std::string& id, const char* volume, uint32_t absorption_index, uint32_t scattering_index, float g, bool explicit_connections) {
+  return _private->add(cls, id, volume, absorption_index, scattering_index, g, explicit_connections);
+}
+
+uint32_t MediumPool::add_noise(Medium::Class cls, const std::string& id, DensityGrid::NoiseFunction noise_type, uint32_t absorption_index, uint32_t scattering_index,
+  float anisotropy, bool explicit_connections, float noise_scale, uint32_t noise_octaves, float noise_lacunarity, float noise_persistence, uint32_t noise_seed, float noise_power,
+  const float3& noise_offset) {
+  auto existing = _private->mapping.find(id);
+  if (existing != _private->mapping.end()) {
+    return existing->second;
+  }
+
+  uint32_t handle = static_cast<uint32_t>(_private->mediums.size());
+  _private->mediums.emplace_back();
+
+  Medium& medium = _private->mediums[handle];
+  medium.cls = cls;
+  medium.absorption_index = absorption_index;
+  medium.scattering_index = scattering_index;
+  medium.phase_function_g = anisotropy;
+  medium.enable_explicit_connections = explicit_connections;
+  medium.bounds = BoundingBox{{-1.0f, -1.0f, -1.0f}, 0.0f, {1.0f, 1.0f, 1.0f}, 0.0f};
+
+  medium.grid.type = DensityGrid::Type::NoiseFunction;
+  medium.grid.noise_type = noise_type;
+  medium.grid.noise.scale = noise_scale;
+  medium.grid.noise.octaves = noise_octaves;
+  medium.grid.noise.lacunarity = noise_lacunarity;
+  medium.grid.noise.persistence = noise_persistence;
+  medium.grid.noise.seed = noise_seed;
+  medium.grid.noise.power = noise_power;
+  medium.grid.noise.sharpness = 1.0f;
+  medium.grid.noise.offset = noise_offset;
+  medium.grid.noise.enable_border_fade = 0u;
+  medium.grid.noise.border_fade_distance = 0.1f;
+  medium.cls = Medium::Class::Heterogeneous;
+
+  _private->mapping[id] = handle;
+  return handle;
 }
 
 Medium& MediumPool::get(uint32_t handle) {

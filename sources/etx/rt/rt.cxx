@@ -169,7 +169,9 @@ struct RaytracingImpl {
     }
     scene_buffer_size = align_up(scene_buffer_size + array_size(gpu.scene.images), 16llu);
     for (uint32_t i = 0; i < gpu.scene.mediums.count; ++i) {
-      scene_buffer_size = align_up(scene_buffer_size + array_size(gpu.scene.mediums[i].density), 16llu);
+      if (gpu.scene.mediums[i].grid.type == DensityGrid::Type::Texture3D) {
+        scene_buffer_size = align_up(scene_buffer_size + array_size(gpu.scene.mediums[i].grid.density), 16llu);
+      }
     }
     scene_buffer_size = align_up(scene_buffer_size + array_size(gpu.scene.mediums), 16llu);
 
@@ -218,7 +220,9 @@ struct RaytracingImpl {
       auto medium_ptr = reinterpret_cast<Medium*>(calloc(sizeof(Medium), gpu.scene.mediums.count));
       for (uint32_t i = 0; (medium_ptr != nullptr) && (i < gpu.scene.mediums.count); ++i) {
         auto medium = gpu.scene.mediums[i];
-        push_to_generic_buffer(scene_buffer, medium.density, copy_offset);
+        if (medium.grid.type == DensityGrid::Type::Texture3D) {
+          push_to_generic_buffer(scene_buffer, medium.grid.density, copy_offset);
+        }
         medium_ptr[i] = medium;
       }
       gpu.scene.mediums = make_array_view<Medium>(medium_ptr, gpu.scene.mediums.count);

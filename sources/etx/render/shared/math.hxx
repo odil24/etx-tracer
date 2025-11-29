@@ -579,11 +579,21 @@ struct ETX_ALIGNED BoundingBox {
   float pad1 ETX_EMPTY_INIT;
 
   ETX_GPU_CODE float3 to_local(const float3& p) const {
-    return (p - p_min) / (p_max - p_min);
+    float3 size = p_max - p_min;
+    float3 result = {};
+    result.x = (size.x > kEpsilon) ? ((p.x - p_min.x) / size.x) : 0.0f;
+    result.y = (size.y > kEpsilon) ? ((p.y - p_min.y) / size.y) : 0.0f;
+    result.z = (size.z > kEpsilon) ? ((p.z - p_min.z) / size.z) : 0.0f;
+    return result;
   }
 
   ETX_GPU_CODE float3 from_local(const float3& p) const {
-    return p * (p_max - p_min) + p_min;
+    float3 size = p_max - p_min;
+    return float3{
+      p.x * size.x + p_min.x,
+      p.y * size.y + p_min.y,
+      p.z * size.z + p_min.z,
+    };
   }
 
   ETX_GPU_CODE bool contains(const float3& p) const {
@@ -612,7 +622,9 @@ struct ETX_ALIGNED Triangle {
 };
 
 struct ETX_ALIGNED Mesh {
+  float3 bbox_min = {};
   uint32_t triangle_offset = 0u;
+  float3 bbox_max = {};
   uint32_t triangle_count = 0u;
 };
 
