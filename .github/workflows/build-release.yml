@@ -44,25 +44,25 @@ jobs:
           fi
 
       # -----------------------------
-      # Setup Embree
+      # Skip Embree
       # -----------------------------
-      - name: Setup Embree
+      - name: Skip Embree
         shell: bash
         run: |
-          mkdir -p thirdparty/embree
+          mkdir -p thirdparty/embree/include
+          mkdir -p thirdparty/embree/lib
+          touch thirdparty/embree/include/DummyEmbree.h
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            curl -L -o embree.zip https://github.com/embree/embree/releases/download/v4.6.3/embree-4.6.3.x64.windows.zip
-            unzip -q embree.zip -d thirdparty/embree
+            touch thirdparty/embree/lib/DummyEmbree.lib
           else
-            curl -L -o embree.tar.gz https://github.com/embree/embree/releases/download/v4.6.3/embree-4.6.3.x86_64.macOS.tar.gz
-            tar -xzf embree.tar.gz -C thirdparty/embree
+            touch thirdparty/embree/lib/libDummyEmbree.a
           fi
 
       # -----------------------------
       # Configure CMake
       # -----------------------------
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DEMBREE_LOCATION=thirdparty/embree
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       # -----------------------------
       # Build
