@@ -29,34 +29,6 @@ jobs:
         uses: jwlawson/actions-setup-cmake@v2
 
       # -----------------------------
-      # Download Official OIDN
-      # -----------------------------
-      - name: Download OIDN
-        shell: bash
-        env:
-          OIDN_VERSION: "2.3.3"
-        run: |
-          echo "Preparing Official OIDN v${OIDN_VERSION}..."
-          mkdir -p thirdparty/oidn
-          cd thirdparty/oidn
-
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            URL="https://github.com/OpenImageDenoise/oidn/releases/download/v${OIDN_VERSION}/oidn-${OIDN_VERSION}.x64.windows.zip"
-            curl -L -o oidn.zip "$URL"
-            unzip oidn.zip
-            mv oidn-${OIDN_VERSION}/include ./include
-            mv oidn-${OIDN_VERSION}/lib ./lib
-            rm -rf oidn-${OIDN_VERSION} oidn.zip
-          else
-            URL="https://github.com/OpenImageDenoise/oidn/releases/download/v${OIDN_VERSION}/oidn-${OIDN_VERSION}.x86_64.macos.tar.gz"
-            curl -L -o oidn.tar.gz "$URL"
-            tar -xzf oidn.tar.gz
-            mv oidn-${OIDN_VERSION}/include ./include
-            mv oidn-${OIDN_VERSION}/lib ./lib
-            rm -rf oidn-${OIDN_VERSION} oidn.tar.gz
-          fi
-
-      # -----------------------------
       # Configure CMake
       # -----------------------------
       - name: Configure CMake
