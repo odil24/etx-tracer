@@ -1,6 +1,7 @@
 name: Build Release
 
 on:
+  workflow_dispatch:       # кнопка Run workflow
   push:
     tags:
       - "v*"
@@ -10,18 +11,26 @@ jobs:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, macos-latest]
 
     steps:
+      # -----------------------------
+      # Checkout repository
+      # -----------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------- Install CMake ----------
+      # -----------------------------
+      # Install CMake
+      # -----------------------------
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v2
 
-      # ---------- Download OIDN from RenderKit ----------
+      # -----------------------------
+      # Download OIDN from RenderKit
+      # -----------------------------
       - name: Download OIDN
         shell: bash
         env:
@@ -37,39 +46,107 @@ jobs:
             URL="https://github.com/RenderKit/oidn/releases/download/v${OIDN_VERSION}/oidn-v${OIDN_VERSION}-macos.zip"
           fi
 
-          echo "Downloading: $URL"
+          echo "Downloading OIDN from $URL"
           curl -L -o oidn.zip "$URL"
-
           unzip oidn.zip
           mv oidn-v${OIDN_VERSION}/include ./include
           mv oidn-v${OIDN_VERSION}/lib ./lib
-
           rm -rf oidn-v${OIDN_VERSION} oidn.zip
 
-      # ---------- Configure ----------
+      # -----------------------------
+      # Configure CMake
+      # -----------------------------
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-      # ---------- Build ----------
+      # -----------------------------
+      # Build
+      # -----------------------------
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      # ---------- Package ----------
+      # -----------------------------
+      # Smoke test (--help)
+      # -----------------------------
+      - name: Smoke test (Windows)
+        if: matrix.os == 'windows-latest'
+        run: ./build/Release/etx-tracer.exe --help
+        shell: bash
+
+      - name: Smoke test (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          chmod +x build/etx-tracer
+          ./build/etx-tracer --help
+        shell: bash
+
+      # -----------------------------
+      # Render minimal test scene
+      # -----------------------------
+      - name: Create test scene
+        run: |
+          mkdir -p tests
+          cat <<EOF > tests/test_scene.json
+          {
+            "camera": {
+              "type": "perspective",
+              "fov": 45,
+              "position": [0,0,3],
+              "look_at": [0,0,0]
+            },
+            "objects": [
+              {
+                "type": "sphere",
+                "radius": 1,
+                "position": [0,0,0],
+                "material": {
+                  "type": "diffuse",
+                  "albedo": [0.7,0.7,0.7]
+                }
+              }
+            ],
+            "lights": [
+              {
+                "type": "point",
+                "position": [3,3,3],
+                "intensity": [4,4,4]
+              }
+            ]
+          }
+          EOF
+
+      - name: Render test (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          ./build/Release/etx-tracer.exe tests/test_scene.json test.png
+          if [ ! -f test.png ]; then exit 1; fi
+        shell: bash
+
+      - name: Render test (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          ./build/etx-tracer tests/test_scene.json test.png
+          if [ ! -f test.png ]; then exit 1; fi
+        shell: bash
+
+      # -----------------------------
+      # Package artifacts
+      # -----------------------------
       - name: Package
         shell: bash
         run: |
           mkdir -p artifacts
-
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp build/Release/*.exe artifacts/
           else
             cp build/*.app -r artifacts/ 2>/dev/null || true
             cp build/* artifacts/ 2>/dev/null || true
           fi
-
           zip -r release-${{ matrix.os }}.zip artifacts
 
-      # ---------- Upload Artifact ----------
+      # -----------------------------
+      # Upload Artifact
+      # -----------------------------
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
