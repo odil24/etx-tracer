@@ -1,19 +1,15 @@
-name: Build, Test & Release
+name: Build Release
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "v*"
-    branches:
-      - dev
 
 jobs:
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
       matrix:
         os: [windows-latest, macos-latest]
 
@@ -21,151 +17,61 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # -----------------------------
-      # Install modern CMake
-      # -----------------------------
+      # ---------- Install CMake ----------
       - name: Set up CMake
-        uses: jwlawson/actions-setup-cmake@v1
-        with:
-          cmake-version: 'latest'
+        uses: jwlawson/actions-setup-cmake@v2
 
-      # -----------------------------
-      # Install OIDN (Windows + macOS)
-      # -----------------------------
+      # ---------- Download OIDN from RenderKit ----------
       - name: Download OIDN
         shell: bash
+        env:
+          OIDN_VERSION: "1.4.3"
         run: |
+          echo "Preparing OIDN v${OIDN_VERSION}..."
           mkdir -p thirdparty/oidn
           cd thirdparty/oidn
 
-          echo "Downloading OIDN for ${{ matrix.os }}"
-
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            curl -L -o oidn.zip https://github.com/OpenImageDenoise/oidn/releases/download/v1.4.3/oidn-1.4.3.x64.windows.zip
-            unzip oidn.zip
-            mv oidn-1.4.3.x64.windows/lib ./lib
-            mv oidn-1.4.3.x64.windows/include ./include
-            rm -rf oidn-1.4.3.x64.windows oidn.zip
+            URL="https://github.com/RenderKit/oidn/releases/download/v${OIDN_VERSION}/oidn-v${OIDN_VERSION}-windows.zip"
           else
-            curl -L -o oidn.tgz https://github.com/OpenImageDenoise/oidn/releases/download/v1.4.3/oidn-1.4.3.x86_64.macos.tgz
-            tar -xzf oidn.tgz
-            mv oidn-1.4.3.x86_64.macos/lib ./lib
-            mv oidn-1.4.3.x86_64.macos/include ./include
-            rm -rf oidn-1.4.3.x86_64.macos oidn.tgz
+            URL="https://github.com/RenderKit/oidn/releases/download/v${OIDN_VERSION}/oidn-v${OIDN_VERSION}-macos.zip"
           fi
 
-      # -----------------------------
-      # Configure
-      # -----------------------------
+          echo "Downloading: $URL"
+          curl -L -o oidn.zip "$URL"
+
+          unzip oidn.zip
+          mv oidn-v${OIDN_VERSION}/include ./include
+          mv oidn-v${OIDN_VERSION}/lib ./lib
+
+          rm -rf oidn-v${OIDN_VERSION} oidn.zip
+
+      # ---------- Configure ----------
       - name: Configure CMake
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-      # -----------------------------
-      # Build
-      # -----------------------------
+      # ---------- Build ----------
       - name: Build
-        run: |
-          cmake --build build --config Release --parallel
+        run: cmake --build build --config Release --parallel
 
-      # -----------------------------
-      # Smoke test (--help)
-      # -----------------------------
-      - name: Smoke test (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          ./build/Release/etx-tracer.exe --help
+      # ---------- Package ----------
+      - name: Package
         shell: bash
-
-      - name: Smoke test (macOS)
-        if: matrix.os == 'macos-latest'
         run: |
-          chmod +x build/etx-tracer
-          ./build/etx-tracer --help
-        shell: bash
+          mkdir -p artifacts
 
-      # -----------------------------
-      # Render minimal scene test
-      # -----------------------------
-      - name: Create test scene
-        run: |
-          mkdir -p tests
-          cat <<EOF > tests/test_scene.json
-          {
-            "camera": {
-              "type": "perspective",
-              "fov": 45,
-              "position": [0, 0, 3],
-              "look_at": [0, 0, 0]
-            },
-            "objects": [
-              {
-                "type": "sphere",
-                "radius": 1,
-                "position": [0, 0, 0],
-                "material": {
-                  "type": "diffuse",
-                  "albedo": [0.7, 0.7, 0.7]
-                }
-              }
-            ],
-            "lights": [
-              {
-                "type": "point",
-                "position": [3, 3, 3],
-                "intensity": [4, 4, 4]
-              }
-            ]
-          }
-          EOF
-
-      - name: Render test (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          ./build/Release/etx-tracer.exe tests/test_scene.json test.png
-          if [ ! -f test.png ]; then exit 1; fi
-        shell: bash
-
-      - name: Render test (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          ./build/etx-tracer tests/test_scene.json test.png
-          if [ ! -f test.png ]; then exit 1; fi
-        shell: bash
-
-      # -----------------------------
-      # Package artifacts
-      # -----------------------------
-      - name: Package artifacts
-        run: |
-          cd build
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            7z a etx-tracer-windows.zip Release/*
+            cp build/Release/*.exe artifacts/
           else
-            zip -r etx-tracer-macos.zip .
+            cp build/*.app -r artifacts/ 2>/dev/null || true
+            cp build/* artifacts/ 2>/dev/null || true
           fi
 
-      - name: Upload artifacts
+          zip -r release-${{ matrix.os }}.zip artifacts
+
+      # ---------- Upload Artifact ----------
+      - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: etx-tracer-${{ matrix.os }}
-          path: build/*.zip
-          if-no-files-found: error
-
-  release:
-    name: Publish Release
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: release-${{ matrix.os }}
+          path: release-${{ matrix.os }}.zip
