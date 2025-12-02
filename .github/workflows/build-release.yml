@@ -21,23 +21,56 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Modern CMake installer (no deprecated APIs)
+      # -----------------------------
+      # Install modern CMake
+      # -----------------------------
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v1
         with:
           cmake-version: 'latest'
 
-      - name: Configure
+      # -----------------------------
+      # Install OIDN (Windows + macOS)
+      # -----------------------------
+      - name: Download OIDN
+        shell: bash
+        run: |
+          mkdir -p thirdparty/oidn
+          cd thirdparty/oidn
+
+          echo "Downloading OIDN for ${{ matrix.os }}"
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            curl -L -o oidn.zip https://github.com/OpenImageDenoise/oidn/releases/download/v1.4.3/oidn-1.4.3.x64.windows.zip
+            unzip oidn.zip
+            mv oidn-1.4.3.x64.windows/lib ./lib
+            mv oidn-1.4.3.x64.windows/include ./include
+            rm -rf oidn-1.4.3.x64.windows oidn.zip
+          else
+            curl -L -o oidn.tgz https://github.com/OpenImageDenoise/oidn/releases/download/v1.4.3/oidn-1.4.3.x86_64.macos.tgz
+            tar -xzf oidn.tgz
+            mv oidn-1.4.3.x86_64.macos/lib ./lib
+            mv oidn-1.4.3.x86_64.macos/include ./include
+            rm -rf oidn-1.4.3.x86_64.macos oidn.tgz
+          fi
+
+      # -----------------------------
+      # Configure
+      # -----------------------------
+      - name: Configure CMake
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release
 
+      # -----------------------------
+      # Build
+      # -----------------------------
       - name: Build
         run: |
           cmake --build build --config Release --parallel
 
-      # --------------------------
+      # -----------------------------
       # Smoke test (--help)
-      # --------------------------
+      # -----------------------------
       - name: Smoke test (Windows)
         if: matrix.os == 'windows-latest'
         run: |
@@ -51,9 +84,9 @@ jobs:
           ./build/etx-tracer --help
         shell: bash
 
-      # --------------------------
-      # Render Test
-      # --------------------------
+      # -----------------------------
+      # Render minimal scene test
+      # -----------------------------
       - name: Create test scene
         run: |
           mkdir -p tests
@@ -100,7 +133,9 @@ jobs:
           if [ ! -f test.png ]; then exit 1; fi
         shell: bash
 
-      # Packaging
+      # -----------------------------
+      # Package artifacts
+      # -----------------------------
       - name: Package artifacts
         run: |
           cd build
@@ -114,8 +149,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: etx-tracer-${{ matrix.os }}
-          path: |
-            build/*.zip
+          path: build/*.zip
           if-no-files-found: error
 
   release:
