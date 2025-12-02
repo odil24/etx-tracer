@@ -1,0 +1,140 @@
+name: Build, Test & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@v3
+
+      - name: Configure
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build build --config Release --parallel
+
+      # ----------------------------------------------------
+      # Smoke test: Program starts and exits without errors
+      # ----------------------------------------------------
+      - name: Smoke test (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          ./build/Release/etx-tracer.exe --help
+        shell: bash
+
+      - name: Smoke test (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          chmod +x build/etx-tracer
+          ./build/etx-tracer --help
+        shell: bash
+
+      # ----------------------------------------------------
+      # Render test: Render minimal scene → verify output
+      # ----------------------------------------------------
+      - name: Prepare test scene
+        run: |
+          mkdir -p tests
+          cat <<EOF > tests/test_scene.json
+          {
+            "camera": {
+              "type": "perspective",
+              "fov": 45,
+              "position": [0, 0, 3],
+              "look_at": [0, 0, 0]
+            },
+            "objects": [
+              {
+                "type": "sphere",
+                "radius": 1,
+                "position": [0, 0, 0],
+                "material": {
+                  "type": "diffuse",
+                  "albedo": [0.7, 0.7, 0.7]
+                }
+              }
+            ],
+            "lights": [
+              {
+                "type": "point",
+                "position": [3, 3, 3],
+                "intensity": [4, 4, 4]
+              }
+            ]
+          }
+          EOF
+
+      - name: Render test (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          ./build/Release/etx-tracer.exe tests/test_scene.json test_output.png
+          if [ ! -f test_output.png ]; then
+            echo "Render failed: output file not created!"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Render test (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          ./build/etx-tracer tests/test_scene.json test_output.png
+          if [ ! -f test_output.png ]; then
+            echo "Render failed: output file not created!"
+            exit 1
+          fi
+        shell: bash
+
+      # ----------------------------------------------------
+      # Packaging
+      # ----------------------------------------------------
+      - name: Package artifacts
+        run: |
+          cd build
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+              7z a etx-tracer-windows.zip Release/*
+          else
+              zip -r etx-tracer-macos.zip .
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: etx-tracer-${{ matrix.os }}
+          path: |
+            build/etx-tracer-windows.zip
+            build/etx-tracer-macos.zip
+          if-no-files-found: ignore
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
