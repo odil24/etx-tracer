@@ -1,7 +1,7 @@
 name: Build Release
 
 on:
-  workflow_dispatch:       # кнопка "Run workflow"
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -29,18 +29,14 @@ jobs:
         uses: jwlawson/actions-setup-cmake@v2
 
       # -----------------------------
-      # Create dummy OIDN (skip real download)
+      # Skip OIDN
       # -----------------------------
       - name: Skip OIDN
         shell: bash
         run: |
           mkdir -p thirdparty/oidn/include
           mkdir -p thirdparty/oidn/lib
-
-          # пустой заголовочный файл
           touch thirdparty/oidn/include/DummyOIDN.h
-
-          # пустая библиотека (кроссплатформенно)
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             touch thirdparty/oidn/lib/DummyOIDN.lib
           else
@@ -48,10 +44,25 @@ jobs:
           fi
 
       # -----------------------------
+      # Setup Embree
+      # -----------------------------
+      - name: Setup Embree
+        shell: bash
+        run: |
+          mkdir -p thirdparty/embree
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            curl -L -o embree.zip https://github.com/embree/embree/releases/download/v4.6.3/embree-4.6.3.x64.windows.zip
+            unzip -q embree.zip -d thirdparty/embree
+          else
+            curl -L -o embree.tar.gz https://github.com/embree/embree/releases/download/v4.6.3/embree-4.6.3.x86_64.macOS.tar.gz
+            tar -xzf embree.tar.gz -C thirdparty/embree
+          fi
+
+      # -----------------------------
       # Configure CMake
       # -----------------------------
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DEMBREE_LOCATION=thirdparty/embree
 
       # -----------------------------
       # Build
