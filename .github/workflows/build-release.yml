@@ -1,12 +1,12 @@
 name: Build, Test & Release
 
 on:
-  workflow_dispatch:        # кнопка Run workflow
+  workflow_dispatch:
   push:
     tags:
       - "v*"
     branches:
-      - dev                 # релизы только с ветки dev
+      - dev
 
 jobs:
   build:
@@ -21,8 +21,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Modern CMake installer (no deprecated APIs)
       - name: Set up CMake
-        uses: lukka/get-cmake@v2
+        uses: jwlawson/actions-setup-cmake@v1
+        with:
+          cmake-version: 'latest'
 
       - name: Configure
         run: |
@@ -32,9 +35,9 @@ jobs:
         run: |
           cmake --build build --config Release --parallel
 
-      # ----------------------------------------------------
-      # Smoke Test — проверка запуска (--help)
-      # ----------------------------------------------------
+      # --------------------------
+      # Smoke test (--help)
+      # --------------------------
       - name: Smoke test (Windows)
         if: matrix.os == 'windows-latest'
         run: |
@@ -48,10 +51,10 @@ jobs:
           ./build/etx-tracer --help
         shell: bash
 
-      # ----------------------------------------------------
-      # Render Test — создаём минимальную сцену и рендерим
-      # ----------------------------------------------------
-      - name: Prepare test scene
+      # --------------------------
+      # Render Test
+      # --------------------------
+      - name: Create test scene
         run: |
           mkdir -p tests
           cat <<EOF > tests/test_scene.json
@@ -86,33 +89,25 @@ jobs:
       - name: Render test (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          ./build/Release/etx-tracer.exe tests/test_scene.json test_output.png
-          if [ ! -f test_output.png ]; then
-            echo "Render failed: test_output.png not found!"
-            exit 1
-          fi
+          ./build/Release/etx-tracer.exe tests/test_scene.json test.png
+          if [ ! -f test.png ]; then exit 1; fi
         shell: bash
 
       - name: Render test (macOS)
         if: matrix.os == 'macos-latest'
         run: |
-          ./build/etx-tracer tests/test_scene.json test_output.png
-          if [ ! -f test_output.png ]; then
-            echo "Render failed: test_output.png not found!"
-            exit 1
-          fi
+          ./build/etx-tracer tests/test_scene.json test.png
+          if [ ! -f test.png ]; then exit 1; fi
         shell: bash
 
-      # ----------------------------------------------------
       # Packaging
-      # ----------------------------------------------------
       - name: Package artifacts
         run: |
           cd build
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-              7z a etx-tracer-windows.zip Release/*
+            7z a etx-tracer-windows.zip Release/*
           else
-              zip -r etx-tracer-macos.zip .
+            zip -r etx-tracer-macos.zip .
           fi
 
       - name: Upload artifacts
@@ -120,9 +115,8 @@ jobs:
         with:
           name: etx-tracer-${{ matrix.os }}
           path: |
-            build/etx-tracer-windows.zip
-            build/etx-tracer-macos.zip
-          if-no-files-found: ignore
+            build/*.zip
+          if-no-files-found: error
 
   release:
     name: Publish Release
@@ -135,7 +129,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*.zip
