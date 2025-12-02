@@ -40,9 +40,9 @@ jobs:
           # пустой заголовочный файл
           touch thirdparty/oidn/include/DummyOIDN.h
 
-          # пустая библиотека
+          # пустая библиотека (кроссплатформенно)
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            type nul > thirdparty/oidn/lib/DummyOIDN.lib
+            touch thirdparty/oidn/lib/DummyOIDN.lib
           else
             touch thirdparty/oidn/lib/libDummyOIDN.a
           fi
