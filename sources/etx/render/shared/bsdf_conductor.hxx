@@ -11,7 +11,7 @@ struct ConductorMaterial {
 };
 
 ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
 
   LocalFrame local_frame(frame);
   auto w_i = local_frame.to_local(-data.w_i);
@@ -69,7 +69,7 @@ ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const 
 }
 
 ETX_GPU_CODE BSDFEval evaluate(const BSDFData& data, const float3& in_w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
 
   LocalFrame local_frame(frame);
   auto w_o = local_frame.to_local(in_w_o);
@@ -104,7 +104,7 @@ ETX_GPU_CODE BSDFEval evaluate(const BSDFData& data, const float3& in_w_o, const
 }
 
 ETX_GPU_CODE float pdf(const BSDFData& data, const float3& in_w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
 
   LocalFrame local_frame(frame);
   auto w_o = local_frame.to_local(in_w_o);

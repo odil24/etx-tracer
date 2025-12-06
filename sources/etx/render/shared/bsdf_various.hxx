@@ -71,7 +71,7 @@ ETX_GPU_CODE BSDFEval diffuse_layer(const BSDFData& data, const float3& local_w_
 }
 
 ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
   auto local_w_i = frame.to_local(-data.w_i);
   auto roughness = evaluate_roughness(mtl, data.tex, scene);
 
@@ -100,7 +100,7 @@ ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const 
 }
 
 ETX_GPU_CODE BSDFEval evaluate(const BSDFData& data, const float3& in_w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
   auto local_w_o = frame.to_local(in_w_o);
 
   if (local_w_o.z <= kEpsilon)
@@ -111,7 +111,8 @@ ETX_GPU_CODE BSDFEval evaluate(const BSDFData& data, const float3& in_w_o, const
 }
 
 ETX_GPU_CODE float pdf(const BSDFData& data, const float3& w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
-  float n_dot_o = dot(data.front_fracing_normal(), w_o);
+  auto frame = data.get_normal_frame(mtl);
+  float n_dot_o = dot(frame.nrm, w_o);
   if (n_dot_o <= kEpsilon)
     return 0.0f;
 
@@ -220,7 +221,7 @@ ETX_GPU_CODE SpectralResponse albedo(const BSDFData& data, const Material& mtl, 
 namespace MirrorBSDF {
 
 ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
 
   BSDFSample result;
   result.w_o = normalize(reflect(data.w_i, frame.nrm));
@@ -233,7 +234,7 @@ ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const 
 ETX_GPU_CODE BSDFEval evaluate(const BSDFData& data, const float3& w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
   BSDFEval result = {data.spectrum_sample, 0.0f};
 
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
   const float3 ideal_w_o = normalize(reflect(data.w_i, frame.nrm));
   const float3 actual_w_o = normalize(w_o);
   if (direction_matches(ideal_w_o, actual_w_o)) {
@@ -246,7 +247,7 @@ ETX_GPU_CODE BSDFEval evaluate(const BSDFData& data, const float3& w_o, const Ma
 }
 
 ETX_GPU_CODE float pdf(const BSDFData& data, const float3& w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
   const float3 ideal_w_o = normalize(reflect(data.w_i, frame.nrm));
   const float3 actual_w_o = normalize(w_o);
   return direction_matches(ideal_w_o, actual_w_o) ? 1.0f : 0.0f;

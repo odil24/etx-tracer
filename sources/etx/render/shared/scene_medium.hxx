@@ -368,4 +368,42 @@ ETX_GPU_CODE float3 medium_sample_phase_function(const Medium& medium, const flo
   return sample_phase_function(w_i, medium.phase_function_g, smp_rnd);
 }
 
+inline void clamp_medium_density(Scene& scene, const Medium& medium) {
+  // Note: We use absolute density limits instead of scene-relative limits
+  // to ensure consistent behavior across different scene sizes
+
+  if (medium.absorption_index == kInvalidIndex || medium.absorption_index >= scene.spectrums.count) {
+    return;
+  }
+
+  if (medium.scattering_index == kInvalidIndex || medium.scattering_index >= scene.spectrums.count) {
+    return;
+  }
+
+  SpectralDistribution& absorption = scene.spectrums[medium.absorption_index];
+  SpectralDistribution& scattering = scene.spectrums[medium.scattering_index];
+
+  // Find maximum values using existing SpectralDistribution method
+  float max_absorption = absorption.maximum_spectral_power();
+  float max_scattering = scattering.maximum_spectral_power();
+
+  float max_extinction = max_absorption + max_scattering;
+  if (max_extinction <= 0.0f) {
+    return;
+  }
+
+  constexpr float kMinMeanFreePathAbsolute = 0.01f;  // Minimum mean free path in absolute units
+  float max_allowed_extinction = 1.0f / kMinMeanFreePathAbsolute;
+
+  if (max_extinction <= max_allowed_extinction) {
+    return;
+  }
+
+  float scale_factor = max_allowed_extinction / max_extinction;
+
+  // Scale both spectra by the same factor to preserve ratios
+  absorption.scale(scale_factor);
+  scattering.scale(scale_factor);
+}
+
 }  // namespace etx

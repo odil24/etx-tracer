@@ -7,6 +7,7 @@
 #include <etx/render/shared/camera.hxx>
 #include <etx/render/shared/ior_database.hxx>
 #include <etx/render/shared/math.hxx>
+#include <etx/render/shared/scene_medium.hxx>
 
 #include "ui.hxx"
 #include "camera_controller.hxx"
@@ -2206,8 +2207,11 @@ void UI::build_medium_selection_properties(Scene& scene, const BuildContext& ctx
   bool changed = build_medium(scene, medium, medium_name);
   if (!ctx.scene_editable)
     ImGui::EndDisabled();
-  if (ctx.scene_editable && changed && callbacks.medium_changed) {
-    callbacks.medium_changed(medium_index);
+  if (ctx.scene_editable && changed) {
+    clamp_medium_density(scene, medium);
+    if (callbacks.medium_changed) {
+      callbacks.medium_changed(medium_index);
+    }
   }
 }
 

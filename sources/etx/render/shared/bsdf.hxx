@@ -35,6 +35,14 @@ struct BSDFData : public Vertex {
     return entering_material ? LocalFrame{tan, btn, nrm, LocalFrame::EnteringMaterial} : LocalFrame{-tan, -btn, -nrm, 0u};
   }
 
+  ETX_GPU_CODE LocalFrame get_normal_frame(const Material& mtl) const {
+    bool entering_material = dot(nrm, w_i) < 0.0f;
+    if (mtl.two_sided && (entering_material == false)) {
+      return LocalFrame{-tan, -btn, -nrm, LocalFrame::EnteringMaterial};
+    }
+    return entering_material ? LocalFrame{tan, btn, nrm, LocalFrame::EnteringMaterial} : LocalFrame{-tan, -btn, -nrm, 0u};
+  }
+
   float3 w_i = {};
   SpectralQuery spectrum_sample = {};
   PathSource path_source = PathSource::Undefined;

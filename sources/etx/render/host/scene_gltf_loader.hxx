@@ -1,5 +1,21 @@
 #pragma once
 
+#include <etx/render/host/scene_data.hxx>
+#include <etx/render/host/scene_loader_utils.hxx>
+#include <etx/render/shared/camera.hxx>
+
+namespace etx {
+
+struct SceneLoaderContext;
+struct Scene;
+struct TaskScheduler;
+
+// Loads glTF (.gltf or .glb) into scene data/context. Returns SceneLoad* flags.
+uint32_t load_from_gltf_file(const char* file_name, bool binary, SceneData& data, SceneLoaderContext& context, Scene& scene, TaskScheduler& scheduler, Camera& active_camera);
+
+}  // namespace etx
+#pragma once
+
 #include <etx/core/pimpl.hxx>
 #include <etx/render/host/scene_data.hxx>
 #include <etx/render/host/scene_loader_utils.hxx>
@@ -16,7 +32,7 @@ struct SceneGltfLoader {
   SceneGltfLoader();
   ~SceneGltfLoader();
 
-  uint32_t load_from_file(const char* file_name, bool binary, SceneData& data, SceneLoaderContext& context, Scene& scene, const IORDatabase& database, TaskScheduler& scheduler);
+  uint32_t load_from_file(const char* file_name, SceneData& data, SceneLoaderContext& context, Scene& scene, const IORDatabase& database, TaskScheduler& scheduler);
 
  private:
   ETX_DECLARE_PIMPL(SceneGltfLoader, 1024);

@@ -16,11 +16,6 @@ struct Scene;
 struct IORDatabase;
 struct TaskScheduler;
 
-struct MaterialDefinition {
-  std::string name;
-  std::map<std::string, std::string> properties;
-};
-
 static constexpr uint32_t kBinaryGeometryMagic = ('B' << 24) | ('x' << 16) | ('t' << 8) | ('E' << 0);
 static constexpr uint32_t kBinaryGeometryVersion = 1u;
 

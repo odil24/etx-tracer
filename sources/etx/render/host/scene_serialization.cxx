@@ -10,6 +10,7 @@
 #include <etx/render/shared/base.hxx>
 #include <etx/render/shared/math.hxx>
 #include <etx/render/shared/scene.hxx>
+#include <etx/render/shared/scene_medium.hxx>
 #include <etx/render/shared/scattering.hxx>
 #include <etx/render/shared/ior_database.hxx>
 

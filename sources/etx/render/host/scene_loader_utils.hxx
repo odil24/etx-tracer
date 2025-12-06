@@ -4,8 +4,14 @@
 #include <etx/render/shared/scene.hxx>
 
 #include <vector>
+#include <map>
 
 namespace etx {
+
+struct MaterialDefinition {
+  std::string name;
+  std::map<std::string, std::string> properties;
+};
 
 enum : uint32_t {
   SceneLoadFailed = 0u,

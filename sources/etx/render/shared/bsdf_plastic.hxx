@@ -12,7 +12,7 @@ struct PlasticMaterial {
 };
 
 ETX_GPU_CODE SpectralResponse specular_func(const BSDFData& data, const float3& in_w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
-  LocalFrame local_frame = {data.tan, data.btn, data.nrm};
+  LocalFrame local_frame = data.get_normal_frame(mtl);
 
   auto w_i = local_frame.to_local(-data.w_i);
   if (LocalFrame::cos_theta(w_i) <= kEpsilon)
@@ -35,7 +35,7 @@ ETX_GPU_CODE SpectralResponse specular_func(const BSDFData& data, const float3& 
 }
 
 ETX_GPU_CODE float specular_pdf(const BSDFData& data, const float3& in_w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
-  LocalFrame local_frame = {data.tan, data.btn, data.nrm};
+  LocalFrame local_frame = data.get_normal_frame(mtl);
 
   auto w_i = local_frame.to_local(-data.w_i);
   if (LocalFrame::cos_theta(w_i) <= kEpsilon)
@@ -74,7 +74,7 @@ ETX_GPU_CODE float specular_pdf(const BSDFData& data, const float3& in_w_o, cons
 }
 
 ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
 
   auto roughness = evaluate_roughness(mtl, data.tex, scene);
   auto ggx = NormalDistribution(frame, roughness);
@@ -115,7 +115,7 @@ ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const 
 }
 
 ETX_GPU_CODE BSDFEval evaluate(const BSDFData& data, const float3& w_o, const Material& mtl, const Scene& scene, Sampler& smp) {
-  auto frame = data.get_normal_frame();
+  auto frame = data.get_normal_frame(mtl);
   float3 m = normalize(w_o - data.w_i);
 
   float n_dot_o = dot(frame.nrm, w_o);

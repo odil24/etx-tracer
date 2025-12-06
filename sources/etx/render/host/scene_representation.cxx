@@ -14,30 +14,18 @@
 #include <etx/render/host/image_pool.hxx>
 #include <etx/render/host/medium_pool.hxx>
 #include <etx/render/host/distribution_builder.hxx>
-#include <etx/render/host/gltf_accessor.hxx>
 #include <etx/render/host/scene_data.hxx>
 #include <etx/render/host/scene_serialization.hxx>
 #include <etx/render/host/scene_loader_utils.hxx>
 #include <etx/rt/integrators/integrator.hxx>
 
+#include <etx/render/host/scene_obj_loader.hxx>
+#include <etx/render/host/scene_gltf_loader.hxx>
+#include <etx/render/host/scene_tungsten_loader.hxx>
+
 #include <tinyexr.hxx>
 
-#include <filesystem>
-#include <sstream>
-#include <iomanip>
-#include <system_error>
-#include <cmath>
-#include <vector>
-#include <string>
-#include <set>
-#include <algorithm>
-#include <cstring>
-#include <initializer_list>
-#include <chrono>
-#include <mutex>
-
 #include <mikktspace.h>
-#include <tiny_obj_loader.hxx>
 
 namespace etx {
 
@@ -78,9 +66,6 @@ struct SceneRepresentationImpl {
   std::mutex mt;
 
   const IORDatabase& ior_database;
-
-  // TODO: MOVE TO scene_obj_loader.cxx - OBJ loader helper function
-  MaterialDefinition convert_tinyobj_to_material_definition(const tinyobj::material_t& material);
 
   std::filesystem::path locate_spectrum_file(const char* identifier, std::initializer_list<const char*> fallback_folders) const {
     if ((identifier == nullptr) || (identifier[0] == 0))
@@ -273,6 +258,14 @@ struct SceneRepresentationImpl {
     });
   }
 
+  void validate_mediums() {
+    // Clamp medium densities to prevent extremely small mean free paths
+    for (uint32_t i = 0; i < context.mediums.array_size(); ++i) {
+      const Medium& medium = context.mediums.get(i);
+      clamp_medium_density(scene, medium);
+    }
+  }
+
   void validate_normals(std::vector<bool>& referenced_vertices, bool& has_invalid_tangents) {
     std::vector<bool> init_normals(data.vertices.nrm.size(), false);
     referenced_vertices.resize(data.vertices.nrm.size());
@@ -432,6 +425,7 @@ struct SceneRepresentationImpl {
     scene.bounding_box_max = bbox_max;
     scene.bounding_sphere_center = 0.5f * (bbox_min + bbox_max);
     scene.bounding_sphere_radius = length(bbox_max - scene.bounding_sphere_center);
+
     scene.vertices.pos = {data.vertices.pos.data(), data.vertices.pos.size()};
     scene.vertices.nrm = {data.vertices.nrm.data(), data.vertices.nrm.size()};
     scene.vertices.tan = {data.vertices.tan.data(), data.vertices.tan.size()};
@@ -450,12 +444,6 @@ struct SceneRepresentationImpl {
     scene.properties[Scene::Properties::Spectral] = spectral;
   }
 
-  enum : uint32_t {
-    LoadFailed = 0u,
-    LoadSucceeded = 1u << 0u,
-    LoadCameraInfo = 1u << 1u,
-  };
-
   struct TriangleEmitterData {
     uint32_t triangle_index;
     uint32_t material_index;
@@ -472,21 +460,9 @@ struct SceneRepresentationImpl {
 
   void set_mesh_material_impl(uint32_t mesh_index, uint32_t material_index);
 
-  // TODO: MOVE TO scene_obj_loader.cxx - OBJ format loader
-  uint32_t load_from_obj(const char* file_name, const char* mtl_file, const std::map<std::string, std::string>& object_to_material);
-
-  // TODO: MOVE TO scene_gltf_loader.cxx - GLTF format loaders
-  uint32_t load_from_gltf(const char* file_name, bool binary);
-  void load_gltf_materials(const tinygltf::Model&);
-  bool load_gltf_node(const tinygltf::Model& model, const tinygltf::Node&, const float4x4& transform);
-  void load_gltf_mesh(const tinygltf::Node& node, const tinygltf::Model& model, const tinygltf::Mesh&, const float4x4& transform);
-  bool load_gltf_camera(const tinygltf::Node& node, const tinygltf::Model& model, const tinygltf::Camera&, const float4x4& transform);
-  float4x4 build_gltf_node_transform(const tinygltf::Node& node);
-
-  std::pair<nlohmann::json, std::map<std::string, std::string>> convert_from_alternative_json_format(const char* filename, const nlohmann::json& js);
-  std::string convert_alternative_materials_to_native(const nlohmann::json& bsdfs);
-  nlohmann::json convert_alternative_camera_to_native(const nlohmann::json& camera);
-  nlohmann::json convert_alternative_integrator_to_native(const nlohmann::json& integrator);
+  // Shared post-loading functions
+  bool finalize_scene_loading(uint32_t options, const char* base_folder, uint32_t load_result, float camera_fov, bool use_focal_len, float camera_focal_len, bool force_tangents,
+    bool spectral_scene);
 };
 
 void build_camera(Camera& camera, const float3& position, const float3& direction, const float3& up, const uint2& viewport, const float fov) {
@@ -764,25 +740,82 @@ bool SceneRepresentation::load_from_file(const char* filename, uint32_t options,
   _private->active_camera.medium_index = kInvalidIndex;
   _private->active_camera.up = kWorldUp;
 
-  auto& camera = _private->active_camera;
-  float3 camera_target = camera.position + camera.direction;  // For backward compatibility
+  Camera json_camera = {};  // Camera for parsing from JSON
+  json_camera.lens_image = kInvalidIndex;
+  json_camera.medium_index = kInvalidIndex;
+  json_camera.up = kWorldUp;
+  json_camera.cls = Camera::Class::Perspective;
+
+  float3 camera_target = json_camera.position + json_camera.direction;  // For backward compatibility
   bool has_target = false;
   bool has_direction = false;
-  float camera_fov = get_camera_fov(camera);
-  float camera_focal_len = fov_to_focal_length(camera_fov);
+  float camera_focal_len = 50.0f;  // Default 50mm focal length
+  float camera_fov = focal_length_to_fov(camera_focal_len) * 180.0f / kPi;
   bool use_focal_len = false;
   bool force_tangents = false;
   bool spectral_scene = false;
-  std::map<std::string, std::string> object_to_material_mapping;
 
   if (strcmp(get_file_ext(filename), ".json") == 0) {
-    auto js = json_from_file(filename);
+    std::string json_content;
+    if (auto f = fopen(filename, "rb")) {
+      if (_fseeki64(f, 0, SEEK_END) == 0) {
+        long long size = _ftelli64(f);
+        if ((size > 0) && (_fseeki64(f, 0, SEEK_SET) == 0)) {
+          json_content.resize(static_cast<size_t>(size));
+          size_t read_bytes = fread(json_content.data(), 1, json_content.size(), f);
+          json_content.resize(read_bytes);
+        }
+      }
+      fclose(f);
+    }
 
-    // Check if this is the alternative JSON format (rough-blue-box style)
-    if (js.contains("bsdfs") && js["bsdfs"].is_array()) {
-      auto [converted_json, mapping] = _private->convert_from_alternative_json_format(filename, js);
-      js = converted_json;
-      object_to_material_mapping = mapping;
+    nlohmann::json js = nlohmann::json::parse(json_content, nullptr, false);
+    bool parsed = js.is_discarded() == false;
+    bool has_bsdfs = parsed && js.is_object() && js.contains("bsdfs");
+    bool is_tungsten = parsed && js.is_object() && has_bsdfs && (js.contains("primitives") || js.contains("renderer"));
+    bool is_native = parsed && js.is_object() && (has_bsdfs == false) && (js.contains("geometry") || js.contains("materials") || js.contains("integrator"));
+
+    if (is_tungsten && (is_native == false)) {
+      if (js.contains("integrator") && js["integrator"].is_object()) {
+        const auto& itg = js["integrator"];
+        auto map_integrator = [](const std::string& s) {
+          if (s == "bidirectional_path_tracer")
+            return Integrator::Type::Bidirectional;
+          if ((s == "vcm") || (s == "progressive_photon_map"))
+            return Integrator::Type::VCM;
+          if (s == "debug")
+            return Integrator::Type::Debug;
+          return Integrator::Type::PathTracing;
+        };
+        if (out_integrator != nullptr) {
+          std::string t = itg.value("type", "");
+          out_integrator->selected = map_integrator(t);
+        }
+        if (itg.contains("min_bounces") && itg["min_bounces"].is_number_integer()) {
+          _private->scene.min_path_length = static_cast<uint32_t>(std::max<int64_t>(0, itg["min_bounces"].get<int64_t>()));
+        }
+        if (itg.contains("max_bounces") && itg["max_bounces"].is_number_integer()) {
+          _private->scene.max_path_length = static_cast<uint32_t>(std::max<int64_t>(0, itg["max_bounces"].get<int64_t>()));
+        }
+      }
+
+      if (js.contains("renderer") && js["renderer"].is_object()) {
+        const auto& rnd = js["renderer"];
+        if (rnd.contains("spp") && rnd["spp"].is_number_integer()) {
+          _private->scene.samples = static_cast<uint32_t>(std::max<int64_t>(1, rnd["spp"].get<int64_t>()));
+        }
+      }
+
+      uint32_t load_result =
+        load_from_tungsten_file(filename, _private->data, _private->context, _private->scene, _private->ior_database, _private->scheduler, _private->active_camera);
+      if ((load_result & SceneLoadSucceeded) == 0)
+        return false;
+      return _private->finalize_scene_loading(options, base_folder, load_result, camera_fov, use_focal_len, camera_focal_len, force_tangents, spectral_scene);
+    }
+
+    if (parsed == false) {
+      log::error("Failed to parse JSON scene %s", filename);
+      return false;
     }
 
     for (auto i = js.begin(), e = js.end(); i != e; ++i) {
@@ -844,38 +877,38 @@ bool SceneRepresentation::load_from_file(const char* filename, uint32_t options,
           const auto& ckey = ci.key();
           const auto& cobj = ci.value();
           if (json_get_string(ci, "class", str_value)) {
-            camera.cls = str_value == "eq" ? Camera::Class::Equirectangular : Camera::Class::Perspective;
+            json_camera.cls = str_value == "eq" ? Camera::Class::Equirectangular : Camera::Class::Perspective;
           } else if (json_get_float(ci, "fov", float_value)) {
             camera_fov = float_value;
           } else if (json_get_float(ci, "focal-length", float_value)) {
             camera_focal_len = float_value;
             use_focal_len = true;
           } else if (json_get_float(ci, "lens-radius", float_value)) {
-            _private->active_camera.lens_radius = float_value;
+            json_camera.lens_radius = float_value;
           } else if (json_get_float(ci, "focal-distance", float_value)) {
-            _private->active_camera.focal_distance = float_value;
+            json_camera.focal_distance = float_value;
           } else if (json_get_float(ci, "clip-near", float_value)) {
-            _private->active_camera.clip_near = float_value;
+            json_camera.clip_near = float_value;
           } else if (json_get_float(ci, "clip-far", float_value)) {
-            _private->active_camera.clip_far = float_value;
+            json_camera.clip_far = float_value;
           } else if (cobj.is_array()) {
             if (ckey == "origin") {
               auto values = cobj.get<std::vector<float>>();
-              get_values(values, &camera.position.x, 3llu);
+              get_values(values, &json_camera.position.x, 3llu);
             } else if (ckey == "target") {
               auto values = cobj.get<std::vector<float>>();
               get_values(values, &camera_target.x, 3llu);
               has_target = true;
             } else if (ckey == "direction") {
               auto values = cobj.get<std::vector<float>>();
-              get_values(values, &camera.direction.x, 3llu);
+              get_values(values, &json_camera.direction.x, 3llu);
               has_direction = true;
             } else if (ckey == "up") {
               auto values = cobj.get<std::vector<float>>();
-              get_values(values, &camera.up.x, 3llu);
+              get_values(values, &json_camera.up.x, 3llu);
             } else if (ckey == "viewport") {
               auto values = cobj.get<std::vector<uint32_t>>();
-              get_values(values, &camera.film_size.x, 2llu);
+              get_values(values, &json_camera.film_size.x, 2llu);
             } else {
               log::warning("Unhandled value in camera description : %s", key.c_str());
             }
@@ -884,12 +917,12 @@ bool SceneRepresentation::load_from_file(const char* filename, uint32_t options,
 
         // Convert legacy target to direction, or ensure direction is normalized
         if (has_direction) {
-          camera.direction = normalize(camera.direction);
+          json_camera.direction = normalize(json_camera.direction);
         } else if (has_target) {
-          camera.direction = normalize(camera_target - camera.position);
+          json_camera.direction = normalize(camera_target - json_camera.position);
         } else {
           // Default direction if neither specified
-          camera.direction = kWorldForward;
+          json_camera.direction = kWorldForward;
         }
       } else if ((key == "integrator") && obj.is_object()) {
         if (out_integrator != nullptr) {
@@ -948,11 +981,7 @@ bool SceneRepresentation::load_from_file(const char* filename, uint32_t options,
     _private->data.json_file_name = filename;
   }
 
-  if (camera.film_size.x * camera.film_size.y == 0) {
-    camera.film_size = {1280, 720};
-  }
-
-  uint32_t load_result = SceneRepresentationImpl::LoadFailed;
+  uint32_t load_result = SceneLoadFailed;
 
   auto ext = get_file_ext(_private->data.geometry_file_name.c_str());
   if (strcmp(ext, ".etx") == 0) {
@@ -962,102 +991,51 @@ bool SceneRepresentation::load_from_file(const char* filename, uint32_t options,
       log::error("Failed to load ETX file from %s", _private->data.geometry_file_name.c_str());
       return false;
     }
-    load_result = SceneRepresentationImpl::LoadSucceeded;
+    load_result = SceneLoadSucceeded;
   } else if (strcmp(ext, ".obj") == 0) {
-    // TODO: REFACTOR - Replace with: SceneObjLoader loader; load_result = loader.load_from_file(...);
-    load_result = _private->load_from_obj(_private->data.geometry_file_name.c_str(), _private->data.materials_file_name.c_str(), object_to_material_mapping);
+    load_result = load_from_obj_file(_private->data.geometry_file_name.c_str(), _private->data.materials_file_name.c_str(), _private->data, _private->context, _private->scene,
+      _private->ior_database, _private->scheduler);
   } else if (strcmp(ext, ".gltf") == 0) {
-    // TODO: REFACTOR - Replace with: SceneGltfLoader loader; load_result = loader.load_from_file(...);
-    load_result = _private->load_from_gltf(_private->data.geometry_file_name.c_str(), false);
+    load_result =
+      load_from_gltf_file(_private->data.geometry_file_name.c_str(), false, _private->data, _private->context, _private->scene, _private->scheduler, _private->active_camera);
   } else if (strcmp(ext, ".glb") == 0) {
-    // TODO: REFACTOR - Replace with: SceneGltfLoader loader; load_result = loader.load_from_file(...);
-    load_result = _private->load_from_gltf(_private->data.geometry_file_name.c_str(), true);
+    load_result =
+      load_from_gltf_file(_private->data.geometry_file_name.c_str(), true, _private->data, _private->context, _private->scene, _private->scheduler, _private->active_camera);
   }
 
-  if ((load_result & SceneRepresentationImpl::LoadSucceeded) == 0) {
+  if ((load_result & SceneLoadSucceeded) == 0) {
     return false;
   }
 
-  bool needs_camera_positioning = false;
-  if (options & SetupCamera) {
-    if (_private->data.cameras.empty()) {
-      if ((load_result & SceneRepresentationImpl::LoadCameraInfo) == 0) {
-        if (use_focal_len) {
-          camera_fov = focal_length_to_fov(camera_focal_len) * 180.0f / kPi;
-        }
-        build_camera(camera, camera.position, camera.direction, camera.up, camera.film_size, camera_fov);
-        needs_camera_positioning = true;
-      }
-    } else {
-      auto it = std::find_if(_private->data.cameras.begin(), _private->data.cameras.end(), [](const auto& e) {
-        return e.active;
-      });
-      const auto& selected = (it != _private->data.cameras.end()) ? *it : _private->data.cameras.front();
-      _private->active_camera = selected.cam;
+  // If camera was parsed from JSON, append it to the cameras list (after geometry cameras)
+  if (has_target || has_direction || json_camera.film_size.x > 0 || json_camera.lens_radius > 0.0f) {
+    if (use_focal_len) {
+      camera_fov = focal_length_to_fov(camera_focal_len) * 180.0f / kPi;
     }
-  }
 
-  // Check if there are any emissive materials that will create area emitters
-  bool has_emissive_materials = false;
-  for (const auto& material : _private->data.materials) {
-    if ((material.emission.spectrum_index != kInvalidIndex) && (material.emission.spectrum_index < _private->data.spectrum_values.size()) &&
-        (_private->data.spectrum_values[material.emission.spectrum_index].luminance() > 0.0f)) {
-      has_emissive_materials = true;
-      break;
+    // Set default film size if not specified
+    if (json_camera.film_size.x * json_camera.film_size.y == 0) {
+      json_camera.film_size = {1280, 720};
     }
+
+    // Create camera entry
+    auto& entry = _private->data.cameras.emplace_back();
+    entry.id = "json_camera";
+    // Only mark as active if no geometry cameras exist
+    entry.active = _private->data.cameras.size() == 1;
+
+    // Build the camera
+    build_camera(entry.cam, json_camera.position, json_camera.direction, json_camera.up, json_camera.film_size, camera_fov);
+
+    // Copy additional camera properties
+    entry.cam.cls = json_camera.cls;
+    entry.cam.lens_radius = json_camera.lens_radius;
+    entry.cam.focal_distance = json_camera.focal_distance;
+    entry.cam.clip_near = json_camera.clip_near;
+    entry.cam.clip_far = json_camera.clip_far;
   }
 
-  if (_private->data.emitter_profiles.empty() && !has_emissive_materials) {
-    MaterialDefinition default_atmosphere{
-      "et::atmosphere",
-      {
-        {"direction", "0.0 2.0 1.0"},
-        {"quality", ETX_DEBUG ? "0.0625" : "0.125"},
-        {"angular_diameter", "0.5422"},
-        {"anisotropy", "0.825"},
-        {"altitude", "1000.0"},
-        {"scale", "1.0"},
-        {"sky_scale", "1.0"},
-        {"sun_scale", "1.0"},
-        {"rayleigh", "1.0"},
-        {"mie", "1.0"},
-        {"ozone", "1.0"},
-      },
-    };
-
-    SceneSerialization serialization;
-    serialization.parse_material_definitions(base_folder, {default_atmosphere}, _private->data, _private->context, _private->scene, _private->ior_database, _private->scheduler);
-    _private->context.images.load_images();
-  }
-
-  _private->validate_materials();
-
-  {
-    TimeMeasure m = {};
-    log::warning("Validating normals and tangents...");
-    bool has_invalid_tangents = false;
-    std::vector<bool> referenced_vertices;
-    _private->validate_normals(referenced_vertices, has_invalid_tangents);
-    log::warning("Normals validated: %.2f sec", m.lap());
-    _private->build_tangents();
-    log::warning("Tangents built: %.2f sec", m.lap());
-    _private->validate_tangents(referenced_vertices, has_invalid_tangents || force_tangents);
-    log::warning("Tangents validated: %.2f sec", m.lap());
-  }
-
-  _private->update_medium_bounds();
-  _private->commit(spectral_scene);
-
-  if (needs_camera_positioning) {
-    constexpr float3 kDefaultViewDirection = {1.0f, 1.0f, 1.0f};
-    float3 position = {};
-    float3 target = {};
-    compute_camera_position_to_fit_scene(_private->scene, _private->active_camera, kDefaultViewDirection, position, target);
-    const float3 direction = normalize(target - position);
-    build_camera(_private->active_camera, position, direction, kWorldUp, _private->active_camera.film_size, camera_fov);
-  }
-
-  return true;
+  return _private->finalize_scene_loading(options, base_folder, load_result, camera_fov, use_focal_len, camera_focal_len, force_tangents, spectral_scene);
 }
 
 SceneRepresentationImpl::TriangleEmitterData SceneRepresentationImpl::compute_triangle_emitter_data(uint32_t triangle_index) {
@@ -1298,1082 +1276,6 @@ void SceneRepresentationImpl::set_mesh_material_impl(uint32_t mesh_index, uint32
     }
   }
 }
-
-// ============================================================================
-// TODO: MOVE TO scene_obj_loader.cxx - START OF OBJ LOADER CODE
-// ============================================================================
-uint32_t SceneRepresentationImpl::load_from_obj(const char* file_name, const char* mtl_file, const std::map<std::string, std::string>& object_to_material) {
-  auto start_time = std::chrono::high_resolution_clock::now();
-
-  auto& triangles = data.triangles;
-  auto& triangle_to_emitter = data.triangle_to_emitter;
-  auto& vertices = data.vertices;
-  auto& material_mapping = data.material_mapping;
-
-  tinyobj::attrib_t obj_attrib;
-  std::vector<tinyobj::shape_t> obj_shapes;
-  std::vector<tinyobj::material_t> obj_materials;
-  std::string warnings;
-  std::string errors;
-
-  constexpr auto kDataBufferSize = 2048llu;
-  static char base_dir[kDataBufferSize] = {};
-  get_base_directory(file_name, base_dir, sizeof(base_dir));
-
-  // Determine material loading approach
-  const char* materials_to_load = nullptr;
-  bool load_obj_materials = false;
-
-  if (mtl_file && mtl_file[0]) {
-    // External materials file specified - we handle it ourselves
-    materials_to_load = nullptr;
-  } else {
-    // No external materials file - let tinyobj try to load embedded/referenced materials
-    // For now, we'll parse for mtllib directives
-    std::ifstream obj_file(file_name);
-    std::string line;
-    while (std::getline(obj_file, line)) {
-      if (line.substr(0, 6) == "mtllib") {
-        std::istringstream iss(line.substr(7));
-        std::string mtl_path;
-        iss >> mtl_path;
-        // Construct full path
-        std::filesystem::path obj_path(file_name);
-        std::filesystem::path mtl_full_path = obj_path.parent_path() / mtl_path;
-        materials_to_load = mtl_full_path.string().c_str();
-        break;
-      }
-    }
-    load_obj_materials = true;
-  }
-
-  // Load OBJ with appropriate material loading
-  if (tinyobj::LoadObj(&obj_attrib, &obj_shapes, &obj_materials, &warnings, &errors, file_name, base_dir, materials_to_load) == false) {
-    log::error("Failed to load OBJ from file: `%s`\n%s", file_name, errors.c_str());
-    return LoadFailed;
-  }
-
-  if (warnings.empty() == false) {
-    log::warning("Loaded OBJ from file: `%s`\n%s", file_name, warnings.c_str());
-  }
-
-  // Handle materials using our native parser
-  if (mtl_file && mtl_file[0]) {
-    // External materials file: use our unified parser (handles both .materials and MTL formats)
-    SceneSerialization serialization;
-    if (!serialization.parse_materials_file(mtl_file, base_dir, data, context, scene, ior_database, scheduler)) {
-      log::warning("Failed to parse materials from %s", mtl_file);
-    }
-  } else if (load_obj_materials && !obj_materials.empty()) {
-    // OBJ-loaded materials: convert from tinyobj format
-    std::vector<MaterialDefinition> material_definitions;
-    material_definitions.reserve(obj_materials.size());
-    for (const auto& material : obj_materials) {
-      material_definitions.emplace_back(convert_tinyobj_to_material_definition(material));
-    }
-
-    SceneSerialization serialization;
-    serialization.parse_material_definitions(base_dir, material_definitions, data, context, scene, ior_database, scheduler);
-  }
-
-  context.images.load_images();
-
-  // Create vertices by deduplicating position/normal/UV values (true geometric deduplication)
-  std::unordered_map<etx::VertexKey, uint32_t, etx::VertexKeyHash> vertex_map;
-  size_t cache_hits = 0;  // Track how many vertices were deduplicated
-
-  uint64_t total_triangles = 0;
-  for (const auto& shape : obj_shapes) {
-    total_triangles += shape.mesh.num_face_vertices.size();
-  }
-
-  triangles.reserve(total_triangles);
-  triangle_to_emitter.reserve(total_triangles);
-
-  const uint64_t total_count = std::min(total_triangles * 3, obj_attrib.vertices.size() / 3);
-  vertices.pos.reserve(total_count);
-  vertices.nrm.reserve(total_count);
-  vertices.tan.reserve(total_count);
-  vertices.btn.reserve(total_count);
-  vertices.tex.reserve(total_count);
-
-  auto processing_start = std::chrono::high_resolution_clock::now();
-
-  for (const auto& shape : obj_shapes) {
-    uint64_t index_offset = 0;
-
-    // Determine material for this shape
-    uint32_t shape_material_index = scene.missing_material;
-    if (!object_to_material.empty()) {
-      // Use object-to-material mapping for alternative JSON format
-      auto it = object_to_material.find(shape.name);
-      if (it != object_to_material.end()) {
-        auto material_it = material_mapping.find(it->second);
-        if (material_it != material_mapping.end()) {
-          shape_material_index = material_it->second;
-        } else {
-          log::warning("Material '%s' assigned to object '%s' not found in materials, using missing material", it->second.c_str(), shape.name.c_str());
-        }
-      } else {
-        log::warning("Object '%s' not found in object-to-material mapping, using missing material", shape.name.c_str());
-      }
-    } else {
-      log::info("No object-to-material mapping provided, using traditional OBJ material assignment");
-    }
-
-    // Group triangles by material within this shape
-    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> material_to_triangle_range;
-
-    for (uint64_t face = 0, face_e = shape.mesh.num_face_vertices.size(); face < face_e; ++face) {
-      uint64_t face_size = shape.mesh.num_face_vertices[face];
-      ETX_ASSERT(face_size == 3);
-
-      uint32_t triangle_index = static_cast<uint32_t>(triangles.size());
-      triangle_to_emitter.emplace_back(kInvalidIndex);
-      auto& tri = triangles.emplace_back();
-
-      // Assign material based on available information
-      if (!object_to_material.empty()) {
-        // Use shape-level material assignment for alternative JSON format
-        tri.material_index = shape_material_index;
-      } else {
-        // Use traditional OBJ material assignment
-        int material_id = shape.mesh.material_ids[face];
-        if (material_id >= 0 && material_id < static_cast<int>(obj_materials.size())) {
-          const auto& source_material = obj_materials[material_id];
-          auto material_it = material_mapping.find(source_material.name);
-          if (material_it != material_mapping.end()) {
-            tri.material_index = material_it->second;
-          } else {
-            log::warning("Material '%s' referenced in OBJ file but not found in materials, using missing material", source_material.name.c_str());
-            tri.material_index = scene.missing_material;
-          }
-        } else {
-          if (material_id >= 0) {
-            log::warning("Material ID %d out of range (max %zu) in OBJ file for face %llu, using missing material", material_id, obj_materials.size(), face);
-          }
-          tri.material_index = scene.missing_material;
-        }
-      }
-
-      for (uint64_t vertex_index = 0; vertex_index < face_size; ++vertex_index) {
-        const auto& index = shape.mesh.indices[index_offset + vertex_index];
-
-        // Get actual vertex data
-        float3 position = make_float3(obj_attrib.vertices.data() + (3 * index.vertex_index));
-        bool has_normal = (index.normal_index >= 0);
-        float3 normal = has_normal ? make_float3(obj_attrib.normals.data() + (3 * index.normal_index)) : float3{0.0f, 1.0f, 0.0f};
-        bool has_uv = (index.texcoord_index >= 0);
-        float2 uv = has_uv ? make_float2(obj_attrib.texcoords.data() + (2 * index.texcoord_index)) : float2{0.0f, 0.0f};
-
-        // Create vertex key for deduplication based on actual values
-        VertexKey key = {position, normal, uv, has_normal, has_uv};
-
-        // Check if we already have this vertex
-        auto it = vertex_map.find(key);
-        if (it != vertex_map.end()) {
-          tri.i[vertex_index] = it->second;
-          cache_hits++;
-        } else {
-          // Create new vertex
-          uint32_t vertex_index_new = static_cast<uint32_t>(vertices.pos.size());
-          tri.i[vertex_index] = vertex_index_new;
-          vertex_map[key] = vertex_index_new;
-
-          vertices.pos.emplace_back(position);
-          vertices.nrm.emplace_back(normal);
-          vertices.tex.emplace_back(uv);
-        }
-      }
-      index_offset += face_size;
-
-      if (validate_triangle(tri, vertices.pos) == false) {
-        triangles.pop_back();
-        triangle_to_emitter.pop_back();
-        continue;
-      }
-
-      // Group by material
-      auto& range = material_to_triangle_range[tri.material_index];
-      if (range.second == 0) {         // First triangle for this material
-        range.first = triangle_index;  // offset
-      }
-      range.second++;  // count
-    }
-
-    // Create meshes for this shape, grouped by material
-    uint32_t material_counter = 0;
-    for (const auto& [material_index, triangle_range] : material_to_triangle_range) {
-      if (triangle_range.second == 0)  // empty range
-        continue;
-
-      // Use shape name, add counter if multiple materials in same shape
-      std::string mesh_name = shape.name;
-      if (material_to_triangle_range.size() > 1) {
-        mesh_name += "_" + std::to_string(material_counter++);
-      }
-
-      // Compute bbox for this mesh
-      float3 mesh_bbox_min = {kMaxFloat, kMaxFloat, kMaxFloat};
-      float3 mesh_bbox_max = {-kMaxFloat, -kMaxFloat, -kMaxFloat};
-      for (uint32_t i = 0; i < triangle_range.second; ++i) {
-        const auto& tri = triangles[triangle_range.first + i];
-        mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[0]]);
-        mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[1]]);
-        mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[2]]);
-        mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[0]]);
-        mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[1]]);
-        mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[2]]);
-      }
-
-      data.add_mesh(mesh_name.c_str(), triangle_range.first, triangle_range.second, mesh_bbox_min, mesh_bbox_max);
-    }
-
-    // Log material assignment result for this shape
-    if (shape_material_index == scene.missing_material) {
-      log::info("Shape '%s': assigned missing material", shape.name.c_str());
-    } else {
-      // Find material name from index
-      std::string material_name = "unknown";
-      for (const auto& [name, index] : material_mapping) {
-        if (index == shape_material_index) {
-          material_name = name;
-          break;
-        }
-      }
-      log::info("Shape '%s': assigned material '%s'", shape.name.c_str(), material_name.c_str());
-    }
-  }
-
-  auto end_time = std::chrono::high_resolution_clock::now();
-  auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-  log::info("OBJ loading total: %lld ms", total_duration.count());
-
-  return true;
-}
-
-// TODO: MOVE TO scene_obj_loader.cxx - OBJ material conversion helper
-MaterialDefinition SceneRepresentationImpl::convert_tinyobj_to_material_definition(const tinyobj::material_t& material) {
-  MaterialDefinition result;
-  result.name = material.name;
-
-  for (const auto& param : material.unknown_parameter) {
-    result.properties[param.first] = param.second;
-  }
-
-  char buffer[256] = {};
-  if (material.shininess != 0.0f) {
-    snprintf(buffer, sizeof(buffer), "%.6f", material.shininess);
-    result.properties["Ns"] = buffer;
-  }
-  if (material.ior != 1.0f) {
-    snprintf(buffer, sizeof(buffer), "%.6f", material.ior);
-    result.properties["Ni"] = buffer;
-  }
-  if (material.dissolve != 1.0f) {
-    snprintf(buffer, sizeof(buffer), "%.6f", material.dissolve);
-    result.properties["d"] = buffer;
-  }
-  if (!material.diffuse_texname.empty()) {
-    result.properties["map_Kd"] = material.diffuse_texname;
-  }
-  if (!material.specular_texname.empty()) {
-    result.properties["map_Ks"] = material.specular_texname;
-  }
-  if (!material.transmittance_texname.empty()) {
-    result.properties["map_Kt"] = material.transmittance_texname;
-  }
-  if (!material.emissive_texname.empty()) {
-    result.properties["map_Ke"] = material.emissive_texname;
-  }
-  if (!material.roughness_texname.empty()) {
-    result.properties["map_Pr"] = material.roughness_texname;
-  }
-  if (!material.metallic_texname.empty()) {
-    result.properties["map_Ml"] = material.metallic_texname;
-  }
-  if (!material.normal_texname.empty()) {
-    result.properties["normalmap"] = std::string("image ") + material.normal_texname;
-  }
-
-  return result;
-}
-// ============================================================================
-// TODO: MOVE TO scene_obj_loader.cxx - END OF OBJ LOADER CODE
-// ============================================================================
-
-// ============================================================================
-// TODO: MOVE TO scene_gltf_loader.cxx - START OF GLTF LOADER CODE
-// ============================================================================
-// TODO: MOVE TO scene_gltf_loader.cxx - GLTF node transform builder
-float4x4 SceneRepresentationImpl::build_gltf_node_transform(const tinygltf::Node& node) {
-  float4x4 transform = {};
-  if (node.matrix.size() == 16) {
-    for (uint32_t i = 0; i < 16u; ++i) {
-      transform.val[i] = float(node.matrix[i]);
-    }
-  } else {
-    float3 translation = {0.0f, 0.0f, 0.0f};
-    if (node.translation.size() == 3) {
-      translation = {float(node.translation[0]), float(node.translation[1]), float(node.translation[2])};
-    }
-    float4 rotation = {0.0f, 0.0f, 0.0f, 1.0f};
-    if (node.rotation.size() == 4) {
-      rotation = {float(node.rotation[0]), float(node.rotation[1]), float(node.rotation[2]), float(node.rotation[3])};
-    }
-    float3 scale = {1.0f, 1.0f, 1.0f};
-    if (node.scale.size() == 3) {
-      scale = {float(node.scale[0]), float(node.scale[1]), float(node.scale[2])};
-    }
-    transform = transform_matrix(translation, rotation, scale);
-  }
-  return transform;
-}
-
-// TODO: MOVE TO scene_gltf_loader.cxx - GLTF camera loader
-bool SceneRepresentationImpl::load_gltf_camera(const tinygltf::Node& node, const tinygltf::Model& model, const tinygltf::Camera& pcam, const float4x4& transform) {
-  auto& entry = data.cameras.emplace_back();
-
-  std::string camera_id = pcam.name.empty() == false ? pcam.name : (node.name.empty() == false ? node.name : "camera");
-  uint32_t index = 1;
-  std::string camera_name = camera_id;
-  while (std::find_if(data.cameras.begin(), data.cameras.end() - 1, [&](const auto& e) {
-    return e.id == camera_name;
-  }) != data.cameras.end() - 1) {
-    char buffer[1024] = {};
-    snprintf(buffer, sizeof(buffer), "%s-%04u", camera_id.c_str(), index);
-    camera_name = buffer;
-    ++index;
-  }
-  entry.id = camera_name;
-  entry.active = (data.cameras.size() == 1);
-
-  auto position = to_float3(transform.col[3]);
-  auto forward = normalize(to_float3(transform.col[2]));
-  auto direction = -forward;
-  auto up = normalize(to_float3(transform.col[1]));
-
-  uint2 film_size = active_camera.film_size;
-  if (film_size.x == 0 || film_size.y == 0) {
-    film_size = {1280u, 720u};
-  }
-
-  if (pcam.type == "perspective") {
-    const auto& cam = pcam.perspective;
-    entry.cam.cls = Camera::Class::Perspective;
-
-    if (cam.aspectRatio > 0.0) {
-      film_size.y = static_cast<uint32_t>(film_size.x / cam.aspectRatio);
-    }
-
-    if (cam.znear > 0.0) {
-      entry.cam.clip_near = static_cast<float>(cam.znear);
-    }
-    if (cam.zfar > 0.0) {
-      entry.cam.clip_far = static_cast<float>(cam.zfar);
-    }
-
-    float fov = static_cast<float>(cam.yfov) * 180.0f / kPi;
-    build_camera(entry.cam, position, direction, up, film_size, fov);
-  } else if (pcam.type == "orthographic") {
-    const auto& cam = pcam.orthographic;
-    entry.cam.cls = Camera::Class::Perspective;
-
-    if (cam.znear > 0.0) {
-      entry.cam.clip_near = static_cast<float>(cam.znear);
-    }
-    if (cam.zfar > 0.0 && cam.zfar > cam.znear) {
-      entry.cam.clip_far = static_cast<float>(cam.zfar);
-    }
-
-    if (cam.xmag > 0.0 && cam.ymag > 0.0) {
-      float aspect = static_cast<float>(cam.xmag / cam.ymag);
-      film_size.y = static_cast<uint32_t>(film_size.x / aspect);
-    }
-
-    float ortho_fov = 2.0f * atanf(static_cast<float>(cam.ymag) * 0.5f) * 180.0f / kPi;
-    build_camera(entry.cam, position, direction, up, film_size, ortho_fov);
-  } else {
-    log::warning("Unknown camera type: %s", pcam.type.c_str());
-    data.cameras.pop_back();
-    return false;
-  }
-
-  if (entry.active) {
-    active_camera = entry.cam;
-  }
-
-  return true;
-}
-
-// TODO: MOVE TO scene_gltf_loader.cxx - GLTF node loader (recursive)
-bool SceneRepresentationImpl::load_gltf_node(const tinygltf::Model& model, const tinygltf::Node& node, const float4x4& parent_transform) {
-  auto current_transform = parent_transform * build_gltf_node_transform(node);
-
-  bool camera_found = false;
-
-  if ((node.mesh >= 0) && (node.mesh < model.meshes.size())) {
-    load_gltf_mesh(node, model, model.meshes.at(node.mesh), current_transform);
-  }
-
-  if ((node.camera >= 0) && (node.camera < model.cameras.size())) {
-    camera_found = load_gltf_camera(node, model, model.cameras.at(node.camera), current_transform);
-  }
-
-  for (const auto& child : node.children) {
-    if (load_gltf_node(model, model.nodes[child], current_transform)) {
-      camera_found = true;
-    }
-  }
-
-  return camera_found;
-}
-
-// TODO: MOVE TO scene_gltf_loader.cxx - Main GLTF loader entry point
-uint32_t SceneRepresentationImpl::load_from_gltf(const char* file_name, bool binary) {
-  tinygltf::TinyGLTF loader;
-  tinygltf::Model model;
-  std::string errors;
-  std::string warnings;
-
-  bool load_result = false;
-
-  auto& gltf_image_mapping = data.gltf_image_mapping;
-  auto& gltf_material_mapping = data.gltf_material_mapping;
-  gltf_image_mapping.clear();
-  gltf_material_mapping.clear();
-  auto image_loader = [](tinygltf::Image* image, const int image_index, std::string* errors, std::string* warnings,  //
-                        int width, int height, const unsigned char* data, int data_size, void* user_pointer) -> bool {
-    auto self = reinterpret_cast<SceneRepresentationImpl*>(user_pointer);
-
-    if (((width == 0) || (height == 0)) && (data != nullptr)) {
-      bool can_write = std::filesystem::exists("./tmp") || std::filesystem::create_directory("./tmp");
-
-      if (can_write) {
-        char buffer[2048] = {};
-        uint32_t hash = fnv1a32(data, data_size, kFnv1a32Begin);
-        snprintf(buffer, sizeof(buffer), "./tmp/img-%x.png", hash);
-        if (auto fout = fopen(buffer, "wb")) {
-          if (fwrite(data, 1, data_size, fout) == data_size) {
-            self->data.gltf_image_mapping[image_index] = self->context.add_image(buffer, Image::RepeatU | Image::RepeatV, {}, {1.0f, 1.0f});
-          }
-          fclose(fout);
-        }
-      }
-    }
-
-    return true;
-  };
-
-  loader.SetImageLoader(image_loader, this);
-
-  if (binary) {
-    load_result = loader.LoadBinaryFromFile(&model, &errors, &warnings, file_name);
-  } else {
-    load_result = loader.LoadASCIIFromFile(&model, &errors, &warnings, file_name);
-  }
-
-  if (warnings.empty() == false) {
-    log::warning("GLTF warning(s): %s", warnings.c_str());
-  }
-
-  if (errors.empty() == false) {
-    log::error("GLTF error(s): %s", errors.c_str());
-  }
-
-  if (load_result == false) {
-    log::error("Failed to load GLTF from %s:\n%s", file_name, errors.c_str());
-    return LoadFailed;
-  }
-
-  constexpr auto kDataBufferSize = 2048llu;
-  static char base_dir[kDataBufferSize] = {};
-  get_base_directory(file_name, base_dir, sizeof(base_dir));
-
-  for (size_t image_index = 0; image_index < model.images.size(); ++image_index) {
-    if (gltf_image_mapping.count(static_cast<int>(image_index)) > 0) {
-      continue;
-    }
-
-    const auto& gltf_image = model.images[image_index];
-    if (gltf_image.uri.empty()) {
-      continue;
-    }
-
-    if (gltf_image.uri.compare(0, 5, "data:") == 0) {
-      continue;
-    }
-
-    std::filesystem::path image_path(gltf_image.uri);
-    if (image_path.is_absolute() == false) {
-      std::filesystem::path base_path(base_dir);
-      image_path = base_path / gltf_image.uri;
-    }
-
-    std::string image_path_str = image_path.lexically_normal().string();
-    gltf_image_mapping[static_cast<int>(image_index)] = context.add_image(image_path_str.c_str(), Image::RepeatU | Image::RepeatV, {}, {1.0f, 1.0f});
-  }
-
-  load_gltf_materials(model);
-
-  // Parse EXT_lights_image_based extension
-  auto ext_it = model.extensions.find("EXT_lights_image_based");
-  if (ext_it != model.extensions.end()) {
-    const auto& ext_value = ext_it->second;
-    if (ext_value.IsObject() && ext_value.Has("lights")) {
-      const auto& lights_value = ext_value.Get("lights");
-      if (lights_value.IsArray()) {
-        for (size_t light_idx = 0; light_idx < lights_value.ArrayLen(); ++light_idx) {
-          const auto& light_obj = lights_value.Get(int(light_idx));
-          if (!light_obj.IsObject())
-            continue;
-
-          // Parse irradiance coefficients (SH coefficients)
-          float3 sh_coeffs[9] = {};
-          bool has_sh_coeffs = false;
-          if (light_obj.Has("irradianceCoefficients")) {
-            const auto& irr_coeffs = light_obj.Get("irradianceCoefficients");
-            if (irr_coeffs.IsArray() && irr_coeffs.ArrayLen() >= 9) {
-              has_sh_coeffs = true;
-              for (size_t i = 0; i < 9 && i < irr_coeffs.ArrayLen(); ++i) {
-                const auto& coeff_array = irr_coeffs.Get(int(i));
-                if (coeff_array.IsArray() && coeff_array.ArrayLen() >= 3) {
-                  sh_coeffs[i] = {float(coeff_array.Get(0).GetNumberAsDouble()), float(coeff_array.Get(1).GetNumberAsDouble()), float(coeff_array.Get(2).GetNumberAsDouble())};
-                }
-              }
-            }
-          }
-
-          if (!has_sh_coeffs)
-            continue;
-
-          // Parse intensity (optional, defaults to 1.0)
-          float intensity = 1.0f;
-          if (light_obj.Has("intensity")) {
-            const auto& intensity_val = light_obj.Get("intensity");
-            if (intensity_val.IsNumber()) {
-              intensity = float(intensity_val.GetNumberAsDouble());
-            }
-          }
-
-          // Apply intensity scaling to SH coefficients
-          for (size_t i = 0; i < 9; ++i) {
-            sh_coeffs[i] = sh_coeffs[i] * intensity;
-          }
-
-          // Parse rotation (optional quaternion)
-          float4 rotation_quat = {0.0f, 0.0f, 0.0f, 1.0f};  // identity quaternion
-          if (light_obj.Has("rotation")) {
-            const auto& rot_array = light_obj.Get("rotation");
-            if (rot_array.IsArray() && rot_array.ArrayLen() >= 4) {
-              rotation_quat = {float(rot_array.Get(0).GetNumberAsDouble()), float(rot_array.Get(1).GetNumberAsDouble()), float(rot_array.Get(2).GetNumberAsDouble()),
-                float(rot_array.Get(3).GetNumberAsDouble())};
-            }
-          }
-
-          float rotation_offset = quaternion_to_yaw_rotation_offset(rotation_quat);
-
-          // Create image from SH coefficients
-          // Use a reasonable resolution for environment maps (typically 512x256 or 1024x512)
-          constexpr uint2 env_image_dimensions = {512u, 256u};
-          uint32_t image_options = Image::BuildSamplingTable | Image::RepeatU;
-          uint32_t image_index = context.images.add_from_spherical_harmonics(sh_coeffs, env_image_dimensions, image_options, {rotation_offset, 0.0f}, {1.0f, 1.0f});
-
-          // Create environment emitter
-          auto& instance = data.emitter_instances.emplace_back(EmitterProfile::Class::Environment);
-          instance.profile = uint32_t(data.emitter_profiles.size());
-
-          auto& e = data.emitter_profiles.emplace_back(EmitterProfile::Class::Environment);
-
-          // Use white spectrum (1.0) so the image provides the actual color values
-          e.emission.spectrum_index = data.add_spectrum(SpectralDistribution::rgb_reflectance({1.0f, 1.0f, 1.0f}));
-          e.emission.image_index = image_index;
-          e.medium_index = kInvalidIndex;
-
-          log::info("Created environment emitter from EXT_lights_image_based extension (light index %zu)", light_idx);
-
-          if (light_obj.Has("specularImages")) {
-            const auto& spec_images_value = light_obj.Get("specularImages");
-            if (spec_images_value.IsArray() && spec_images_value.ArrayLen() > 0) {
-              const auto& mip0_faces = spec_images_value.Get(0);
-              if (mip0_faces.IsArray() && mip0_faces.ArrayLen() >= 6) {
-                int32_t cube_face_indices[6] = {};
-                bool all_faces_valid = true;
-                for (size_t face_idx = 0; face_idx < 6 && face_idx < mip0_faces.ArrayLen(); ++face_idx) {
-                  const auto& face_ref = mip0_faces.Get(int(face_idx));
-                  if (face_ref.IsInt() || face_ref.IsNumber()) {
-                    cube_face_indices[face_idx] = face_ref.GetNumberAsInt();
-                    if ((cube_face_indices[face_idx] < 0) || (gltf_image_mapping.count(cube_face_indices[face_idx]) == 0)) {
-                      all_faces_valid = false;
-                      break;
-                    }
-                  } else {
-                    all_faces_valid = false;
-                    break;
-                  }
-                }
-
-                if (all_faces_valid) {
-                  // Get specularImageSize (default to 256 if not specified)
-                  uint32_t cube_size = 256u;
-                  if (light_obj.Has("specularImageSize")) {
-                    const auto& size_val = light_obj.Get("specularImageSize");
-                    if (size_val.IsInt() || size_val.IsNumber()) {
-                      cube_size = static_cast<uint32_t>(size_val.GetNumberAsInt());
-                    }
-                  }
-
-                  uint32_t cube_face_images[6] = {};
-                  for (size_t i = 0; i < 6; ++i) {
-                    cube_face_images[i] = gltf_image_mapping.at(cube_face_indices[i]);
-                  }
-                  constexpr uint2 equirect_dimensions = {1024u, 512u};
-                  uint32_t specular_image_options = Image::BuildSamplingTable | Image::RepeatU;
-                  uint32_t specular_image_index =
-                    context.images.add_from_cubemap(cube_face_images, equirect_dimensions, specular_image_options, {rotation_offset, 0.0f}, {1.0f, 1.0f});
-
-                  // Save equirectangular image to EXR file
-                  const auto& equirect_image = context.images.get(specular_image_index);
-                  std::filesystem::path tmp_dir = "tmp";
-                  std::filesystem::create_directories(tmp_dir);
-                  char exr_filename[512] = {};
-                  snprintf(exr_filename, sizeof(exr_filename), "tmp/specular_env_%zu.exr", light_idx);
-                  const char* error = nullptr;
-                  if (SaveEXR(reinterpret_cast<const float*>(equirect_image.pixels.f32.a), equirect_dimensions.x, equirect_dimensions.y, 4, false, exr_filename, &error) !=
-                      TINYEXR_SUCCESS) {
-                    log::warning("Failed to save specular environment map to %s: %s", exr_filename, error ? error : "unknown error");
-                  } else {
-                    log::info("Saved specular environment map to %s", exr_filename);
-                  }
-
-                  // Create second environment emitter for specular
-                  auto& spec_instance = data.emitter_instances.emplace_back(EmitterProfile::Class::Environment);
-                  spec_instance.profile = uint32_t(data.emitter_profiles.size());
-
-                  auto& spec_e = data.emitter_profiles.emplace_back(EmitterProfile::Class::Environment);
-                  spec_e.emission.spectrum_index = data.add_spectrum(SpectralDistribution::rgb_reflectance({1.0f, 1.0f, 1.0f}));
-                  spec_e.emission.image_index = specular_image_index;
-                  spec_e.medium_index = kInvalidIndex;
-
-                  log::info("Created specular environment emitter from EXT_lights_image_based extension (light index %zu)", light_idx);
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Check scene-level EXT_lights_image_based references
-  std::set<size_t> referenced_light_indices;
-  for (const auto& scene : model.scenes) {
-    auto scene_ext_it = scene.extensions.find("EXT_lights_image_based");
-    if (scene_ext_it != scene.extensions.end()) {
-      const auto& scene_ext_value = scene_ext_it->second;
-      if (scene_ext_value.IsObject() && scene_ext_value.Has("light")) {
-        const auto& light_ref = scene_ext_value.Get("light");
-        if (light_ref.IsInt() || light_ref.IsNumber()) {
-          int32_t light_index = light_ref.GetNumberAsInt();
-          if (light_index >= 0) {
-            referenced_light_indices.insert(static_cast<size_t>(light_index));
-          }
-        }
-      }
-    }
-  }
-
-  bool camera_loaded = false;
-  for (const auto& scene : model.scenes) {
-    for (int32_t node_index : scene.nodes) {
-      if ((node_index < 0) || (node_index >= model.nodes.size()))
-        continue;
-
-      const float4x4 identity = build_gltf_node_transform({});
-      const auto& node = model.nodes[node_index];
-      if (load_gltf_node(model, node, identity)) {
-        camera_loaded = true;
-      }
-    }
-  }
-
-  return LoadSucceeded | (camera_loaded ? LoadCameraInfo : 0u);
-}
-
-// TODO: MOVE TO scene_gltf_loader.cxx - GLTF material parser
-void SceneRepresentationImpl::load_gltf_materials(const tinygltf::Model& model) {
-  for (int32_t gltf_material_index = 0; gltf_material_index < static_cast<int32_t>(model.materials.size()); ++gltf_material_index) {
-    auto& material = model.materials[gltf_material_index];
-    std::string material_name = material.name;
-    uint32_t index = 1;
-    while (data.has_material(material_name.c_str())) {
-      char buffer[1024] = {};
-      snprintf(buffer, sizeof(buffer), "%s-%04u", material.name.c_str(), index);
-      material_name = buffer;
-      ++index;
-    }
-
-    const auto& pbr = material.pbrMetallicRoughness;
-
-    uint32_t material_index = data.add_material(material_name.c_str());
-    data.gltf_material_mapping[gltf_material_index] = material_index;
-
-    auto& mtl = data.materials[material_index];
-
-    bool is_unlit = false;
-    for (const auto& ext : material.extensions) {
-      if (ext.first == "KHR_materials_unlit") {
-        is_unlit = true;
-        break;
-      }
-    }
-
-    mtl.cls = is_unlit ? Material::Class::Diffuse : Material::Class::Principled;
-    mtl.ext_ior.cls = SpectralDistribution::Class::Dielectric;
-    mtl.ext_ior.eta_index = data.add_spectrum(SpectralDistribution::constant(1.0f));
-    mtl.ext_ior.k_index = data.add_spectrum(SpectralDistribution::constant(0.0f));
-    mtl.int_ior.cls = SpectralDistribution::Class::Conductor;
-    mtl.int_ior.eta_index = data.add_spectrum(SpectralDistribution::constant(kDefaultDielectricEta));
-    mtl.int_ior.k_index = data.add_spectrum(SpectralDistribution::constant(0.0f));
-    mtl.subsurface.spectrum_index = data.add_spectrum(SpectralDistribution::rgb_reflectance({1.0f, 0.2f, 0.04f}));
-    mtl.emission = {};
-    mtl.emission_collimation = 0.0f;
-
-    float3 rgb = {1.0f, 1.0f, 1.0f};
-    const auto& base_color = material.pbrMetallicRoughness.baseColorFactor;
-    if (base_color.size() >= 3) {
-      rgb = {float(base_color[0]), float(base_color[1]), float(base_color[2])};
-    }
-    mtl.scattering.spectrum_index = data.add_spectrum(SpectralDistribution::rgb_reflectance(rgb));
-
-    if (is_unlit == false) {
-      bool has_metallic_roughness_texture = (pbr.metallicRoughnessTexture.index != -1) && (data.gltf_image_mapping.count(pbr.metallicRoughnessTexture.index) > 0);
-      if (has_metallic_roughness_texture) {
-        auto image_index = data.gltf_image_mapping.at(pbr.metallicRoughnessTexture.index);
-        mtl.roughness.image_index = image_index;
-        mtl.roughness.channel = 1u;
-        mtl.roughness.value = {1.0f, 1.0f};
-        mtl.metalness.image_index = image_index;
-        mtl.metalness.channel = 2u;
-        mtl.metalness.value = {1.0f, 1.0f};
-      } else {
-        float roughness = float(pbr.roughnessFactor);
-        float metalness = float(pbr.metallicFactor);
-        mtl.roughness.value = {roughness, roughness};
-        mtl.metalness.value = {metalness, metalness};
-        mtl.roughness.image_index = kInvalidIndex;
-        mtl.metalness.image_index = kInvalidIndex;
-      }
-    }
-
-    if ((pbr.baseColorTexture.index != -1) && (data.gltf_image_mapping.count(pbr.baseColorTexture.index) > 0)) {
-      mtl.scattering.image_index = data.gltf_image_mapping.at(pbr.baseColorTexture.index);
-      mtl.reflectance.image_index = mtl.scattering.image_index;
-    }
-
-    if ((material.normalTexture.index != -1) && (data.gltf_image_mapping.count(material.normalTexture.index) > 0)) {
-      mtl.normal_image_index = data.gltf_image_mapping.at(material.normalTexture.index);
-      mtl.normal_scale = 1.0f;
-      context.add_image_options(mtl.normal_image_index, Image::SkipSRGBConversion);
-    }
-
-    if (material.emissiveFactor.size() >= 3) {
-      float3 emission = {float(material.emissiveFactor[0]), float(material.emissiveFactor[1]), float(material.emissiveFactor[2])};
-      if (dot(emission, emission) >= kEpsilon) {
-        auto spd = SpectralDistribution::rgb_luminance(emission);
-
-        for (const auto& ext : material.extensions) {
-          if (ext.first == "KHR_materials_emissive_strength") {
-            if (ext.second.IsObject() && ext.second.Has("emissiveStrength")) {
-              const auto& value = ext.second.Get("emissiveStrength");
-              if (value.IsNumber()) {
-                float scale = float(value.GetNumberAsDouble());
-                spd.scale(scale);
-              }
-            }
-          }
-        }
-
-        mtl.emission.spectrum_index = data.add_spectrum(spd);
-        mtl.emission_collimation = 0.0f;
-        if ((material.emissiveTexture.index != -1) && (data.gltf_image_mapping.count(material.emissiveTexture.index) > 0)) {
-          mtl.emission.image_index = data.gltf_image_mapping.at(material.emissiveTexture.index);
-        }
-      } else {
-        mtl.emission.spectrum_index = kInvalidIndex;
-        mtl.emission.image_index = kInvalidIndex;
-      }
-
-      for (const auto& ext : material.extensions) {
-        if (ext.first == "KHR_materials_transmission") {
-          bool has_transmission_texture = false;
-          if (ext.second.IsObject() && ext.second.Has("transmissionTexture")) {
-            const auto& tex_obj = ext.second.Get("transmissionTexture");
-            if (tex_obj.IsObject() && tex_obj.Has("index")) {
-              const auto& tex_index = tex_obj.Get("index");
-              if (tex_index.IsNumber()) {
-                int32_t tex_idx = tex_index.GetNumberAsInt();
-                if ((tex_idx >= 0) && (data.gltf_image_mapping.count(tex_idx) > 0)) {
-                  mtl.transmission.image_index = data.gltf_image_mapping.at(tex_idx);
-                  mtl.transmission.channel = 0u;
-                  mtl.transmission.value = {1.0f, 1.0f, 1.0f, 1.0f};
-                  has_transmission_texture = true;
-                }
-              }
-            }
-          }
-          if ((has_transmission_texture == false) && ext.second.IsObject() && ext.second.Has("transmissionFactor")) {
-            const auto& value = ext.second.Get("transmissionFactor");
-            if (value.IsNumber()) {
-              float transmission = float(value.GetNumberAsDouble());
-              mtl.transmission.value = {transmission, transmission, transmission, transmission};
-            }
-          }
-        }
-      }
-    }
-
-    mtl.reflectance.spectrum_index = data.add_spectrum(SpectralDistribution::constant(1.0f));
-  }
-
-  // Missing material is already created during scene initialization
-
-  context.images.load_images();
-}
-
-// TODO: MOVE TO scene_gltf_loader.cxx - GLTF mesh loader
-void SceneRepresentationImpl::load_gltf_mesh(const tinygltf::Node& node, const tinygltf::Model& model, const tinygltf::Mesh& mesh, const float4x4& transform) {
-  auto& triangles = data.triangles;
-  auto& triangle_to_emitter = data.triangle_to_emitter;
-  auto& vertices = data.vertices;
-
-  if (mesh.primitives.empty())
-    return;
-
-  for (size_t primitive_index = 0; primitive_index < mesh.primitives.size(); ++primitive_index) {
-    const auto& primitive = mesh.primitives[primitive_index];
-    bool has_positions = primitive.attributes.count("POSITION") > 0;
-    bool has_normals = primitive.attributes.count("NORMAL") > 0;
-    bool has_tex_coords = primitive.attributes.count("TEXCOORD_0") > 0;
-    bool has_tangents = primitive.attributes.count("TANGENT") > 0;
-
-    if (has_positions == false)
-      continue;
-
-    uint32_t material_index = scene.missing_material;
-    if ((primitive.material >= 0) && (primitive.material < static_cast<int32_t>(model.materials.size()))) {
-      auto it = data.gltf_material_mapping.find(static_cast<int32_t>(primitive.material));
-      if (it != data.gltf_material_mapping.end()) {
-        material_index = it->second;
-      }
-    }
-
-    uint32_t triangle_start = static_cast<uint32_t>(triangles.size());
-    float3 mesh_bbox_min = {kMaxFloat, kMaxFloat, kMaxFloat};
-    float3 mesh_bbox_max = {-kMaxFloat, -kMaxFloat, -kMaxFloat};
-
-    const tinygltf::Accessor& pos_accessor = model.accessors[primitive.attributes.find("POSITION")->second];
-    const tinygltf::BufferView& pos_buffer_view = model.bufferViews[pos_accessor.bufferView];
-    const tinygltf::Buffer& pos_buffer = model.buffers[pos_buffer_view.buffer];
-
-    const tinygltf::Accessor* nrm_accessor = nullptr;
-    const tinygltf::BufferView* nrm_buffer_view = nullptr;
-    const tinygltf::Buffer* nrm_buffer = nullptr;
-    if (has_normals) {
-      nrm_accessor = model.accessors.data() + primitive.attributes.find("NORMAL")->second;
-      nrm_buffer_view = model.bufferViews.data() + nrm_accessor->bufferView;
-      nrm_buffer = model.buffers.data() + nrm_buffer_view->buffer;
-    }
-
-    const tinygltf::Accessor* tex_accessor = nullptr;
-    const tinygltf::BufferView* tex_buffer_view = nullptr;
-    const tinygltf::Buffer* tex_buffer = nullptr;
-    if (has_tex_coords) {
-      tex_accessor = model.accessors.data() + primitive.attributes.find("TEXCOORD_0")->second;
-      tex_buffer_view = model.bufferViews.data() + tex_accessor->bufferView;
-      tex_buffer = model.buffers.data() + tex_buffer_view->buffer;
-    }
-
-    const tinygltf::Accessor* tan_accessor = nullptr;
-    const tinygltf::BufferView* tan_buffer_view = nullptr;
-    const tinygltf::Buffer* tan_buffer = nullptr;
-    if (has_tangents) {
-      auto tangent_it = primitive.attributes.find("TANGENT");
-      if (tangent_it != primitive.attributes.end()) {
-        int tangent_accessor_idx = tangent_it->second;
-        if ((tangent_accessor_idx >= 0) && (tangent_accessor_idx < static_cast<int>(model.accessors.size()))) {
-          tan_accessor = model.accessors.data() + tangent_accessor_idx;
-          if ((tan_accessor->bufferView >= 0) && (tan_accessor->bufferView < static_cast<int>(model.bufferViews.size()))) {
-            tan_buffer_view = model.bufferViews.data() + tan_accessor->bufferView;
-            if ((tan_buffer_view->buffer >= 0) && (tan_buffer_view->buffer < static_cast<int>(model.buffers.size()))) {
-              tan_buffer = model.buffers.data() + tan_buffer_view->buffer;
-            } else {
-              log::warning("GLTF primitive %zu: Invalid buffer index %d for tangent", primitive_index, tan_buffer_view->buffer);
-              has_tangents = false;
-            }
-          } else {
-            log::warning("GLTF primitive %zu: Invalid bufferView index %d for tangent", primitive_index, tan_accessor->bufferView);
-            has_tangents = false;
-          }
-        } else {
-          log::warning("GLTF primitive %zu: Invalid accessor index %d for tangent", primitive_index, tangent_accessor_idx);
-          has_tangents = false;
-        }
-      } else {
-        log::warning("GLTF primitive %zu: TANGENT attribute not found in attributes map", primitive_index);
-        has_tangents = false;
-      }
-    }
-
-    bool has_indices = (primitive.indices >= 0) && (primitive.indices < model.accessors.size());
-
-    const tinygltf::Accessor* idx_accessor = nullptr;
-    const tinygltf::BufferView* idx_buffer_view = nullptr;
-    const tinygltf::Buffer* idx_buffer = nullptr;
-    if (has_indices) {
-      idx_accessor = model.accessors.data() + primitive.indices;
-      idx_buffer_view = model.bufferViews.data() + idx_accessor->bufferView;
-      idx_buffer = model.buffers.data() + idx_buffer_view->buffer;
-    }
-
-    ETX_ASSERT(idx_accessor->count % 3 == 0);
-    uint32_t expected_triangle_count = static_cast<uint32_t>(has_indices ? idx_accessor->count : pos_accessor.count) / 3u;
-
-    uint32_t linear_index = 0;
-    for (uint32_t tri_index = 0; tri_index < expected_triangle_count; ++tri_index) {
-      triangle_to_emitter.emplace_back(kInvalidIndex);
-
-      uint32_t base_index = static_cast<uint32_t>(vertices.pos.size());
-      Triangle& tri = triangles.emplace_back();
-      tri.i[0] = base_index + 0;
-      tri.i[1] = base_index + 1;
-      tri.i[2] = base_index + 2;
-      tri.material_index = material_index;
-
-      for (uint32_t j = 0; j < 3; ++j, ++linear_index) {
-        auto index = has_indices ? gltf_read_buffer_as_uint(*idx_buffer, *idx_accessor, *idx_buffer_view, 3u * tri_index + j) : linear_index;
-
-        auto p = gltf_read_buffer<float3>(pos_buffer, pos_accessor, pos_buffer_view, index);
-        auto pos = transform * float4{p.x, p.y, p.z, 1.0f};
-
-        float3 nrm = {0.0f, 1.0f, 0.0f};
-        if (has_normals) {
-          auto n = gltf_read_buffer<float3>(*nrm_buffer, *nrm_accessor, *nrm_buffer_view, index);
-          auto t = transform * float4{n.x, n.y, n.z, 0.0f};
-          float3 transformed_nrm = float3{t.x, t.y, t.z};
-          float nrm_length_sq = dot(transformed_nrm, transformed_nrm);
-          if (nrm_length_sq > kEpsilon) {
-            nrm = normalize(transformed_nrm);
-          } else {
-            // Zero-length normal: use default
-            nrm = {0.0f, 1.0f, 0.0f};
-            static uint32_t zero_normal_count = 0;
-            if (++zero_normal_count <= 10) {
-              log::warning("GLTF: Zero-length normal detected at vertex %u, using default", static_cast<uint32_t>(vertices.pos.size()));
-            }
-          }
-        }
-
-        float2 tex = {};
-        if (has_tex_coords) {
-          tex = gltf_read_buffer<float2>(*tex_buffer, *tex_accessor, *tex_buffer_view, index);
-        }
-
-        float3 tan = {1.0f, 0.0, 0.0f};
-        float3 btn = {0.0f, 0.0, 1.0f};
-        bool should_compute_tangents = true;
-
-        if (has_tangents) {
-          auto gltf_tangent = gltf_read_buffer<float4>(*tan_buffer, *tan_accessor, *tan_buffer_view, index);
-          auto tt = transform * float4{gltf_tangent.x, gltf_tangent.y, gltf_tangent.z, 0.0f};
-          float3 transformed_tan = float3{tt.x, tt.y, tt.z};
-          float tan_length_sq = dot(transformed_tan, transformed_tan);
-
-          if (tan_length_sq > kEpsilon) {
-            tan = normalize(transformed_tan);
-            tan = normalize(tan - dot(tan, nrm) * nrm);
-            float tan_ortho_length_sq = dot(tan, tan);
-            if (tan_ortho_length_sq > kEpsilon) {
-              tan = normalize(tan);
-              float3 computed_btn = cross(tan, nrm) * (-gltf_tangent.w);
-              float btn_length_sq = dot(computed_btn, computed_btn);
-              if (btn_length_sq > kEpsilon) {
-                btn = normalize(computed_btn);
-                should_compute_tangents = false;
-              }
-            }
-          }
-        }
-
-        if (should_compute_tangents) {
-          tan = {0.0f, 0.0f, 0.0f};
-          btn = {0.0f, 0.0f, 0.0f};
-        }
-
-        vertices.pos.emplace_back(float3{pos.x, pos.y, pos.z});
-        vertices.nrm.emplace_back(float3{nrm.x, nrm.y, nrm.z});
-        vertices.tan.emplace_back(float3{tan.x, tan.y, tan.z});
-        vertices.btn.emplace_back(float3{btn.x, btn.y, btn.z});
-        vertices.tex.emplace_back(float2{tex.x, tex.y});
-      }
-
-      if (validate_triangle(tri, vertices.pos) == false) {
-        triangles.pop_back();
-        triangle_to_emitter.pop_back();
-        vertices.pos.pop_back();
-        vertices.pos.pop_back();
-        vertices.pos.pop_back();
-        vertices.nrm.pop_back();
-        vertices.nrm.pop_back();
-        vertices.nrm.pop_back();
-        vertices.tan.pop_back();
-        vertices.tan.pop_back();
-        vertices.tan.pop_back();
-        vertices.btn.pop_back();
-        vertices.btn.pop_back();
-        vertices.btn.pop_back();
-        vertices.tex.pop_back();
-        vertices.tex.pop_back();
-        vertices.tex.pop_back();
-        continue;
-      }
-
-      mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[0]]);
-      mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[1]]);
-      mesh_bbox_min = min(mesh_bbox_min, vertices.pos[tri.i[2]]);
-      mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[0]]);
-      mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[1]]);
-      mesh_bbox_max = max(mesh_bbox_max, vertices.pos[tri.i[2]]);
-
-      if (has_normals == false) {
-        vertices.nrm[vertices.nrm.size() - 1u] = tri.geo_n;
-        vertices.nrm[vertices.nrm.size() - 2u] = tri.geo_n;
-        vertices.nrm[vertices.nrm.size() - 3u] = tri.geo_n;
-      }
-    }
-
-    // Create mesh for this primitive
-    uint32_t triangle_end = static_cast<uint32_t>(triangles.size());
-    uint32_t triangle_count = triangle_end - triangle_start;
-    if (triangle_count > 0) {
-      std::string mesh_name;
-      if (node.name.empty() == false) {
-        mesh_name = node.name;
-        if (mesh.primitives.size() > 1) {
-          mesh_name += "_" + std::to_string(primitive_index);
-        }
-      } else if (mesh.name.empty() == false) {
-        mesh_name = mesh.name + "_" + std::to_string(primitive_index);
-      } else {
-        mesh_name = "mesh_" + std::to_string(primitive_index);
-      }
-      data.add_mesh(mesh_name.c_str(), triangle_start, triangle_count, mesh_bbox_min, mesh_bbox_max);
-    }
-  }
-}
-// ============================================================================
-// TODO: MOVE TO scene_gltf_loader.cxx - END OF GLTF LOADER CODE
-// ============================================================================
 
 void build_emitters_distribution(Scene& scene) {
   for (uint32_t i = 0; i < scene.emitter_profiles.count; ++i) {
@@ -3008,254 +1910,92 @@ std::string SceneRepresentation::save_to_file(const char* filename, Integrator::
   return json_path.generic_string();
 }
 
-std::pair<nlohmann::json, std::map<std::string, std::string>> SceneRepresentationImpl::convert_from_alternative_json_format(const char* filename, const nlohmann::json& js) {
-  char base_folder[2048] = {};
-  get_file_folder(filename, base_folder, sizeof(base_folder));
+// Shared post-loading finalization function
+bool SceneRepresentationImpl::finalize_scene_loading(uint32_t options, const char* base_folder, uint32_t load_result, float camera_fov, bool use_focal_len, float camera_focal_len,
+  bool force_tangents, bool spectral_scene) {
+  auto& camera = active_camera;
+  bool needs_camera_positioning = false;
 
-  // Start with a clean JSON and only add supported fields
-  nlohmann::json native_json;
-
-  // Add default scene settings
-  native_json["samples"] = 32;
-  native_json["max-path-length"] = 1023;
-  native_json["min-path-length"] = 0;
-  native_json["random-termination-start"] = 6;
-  native_json["spectral"] = false;
-
-  // Convert mesh_file to geometry (keep as relative path, base_folder will be prepended later)
-  if (js.contains("mesh_file") && js["mesh_file"].is_string()) {
-    native_json["geometry"] = js["mesh_file"].get<std::string>();
-  }
-
-  // Convert camera if present
-  if (js.contains("camera")) {
-    native_json["camera"] = convert_alternative_camera_to_native(js["camera"]);
-  }
-
-  // Convert integrator if present
-  if (js.contains("integrator")) {
-    native_json["integrator"] = convert_alternative_integrator_to_native(js["integrator"]);
-  }
-
-  // Convert materials and create materials file reference
-  std::map<std::string, std::string> object_to_material_mapping;
-  if (js.contains("bsdfs") && js["bsdfs"].is_array()) {
-    std::string materials_content = convert_alternative_materials_to_native(js["bsdfs"]);
-
-    // Build object-to-material mapping from bsdfs refs
-    std::map<std::string, int> name_counts;
-    for (const auto& bsdf : js["bsdfs"]) {
-      if (!bsdf.contains("name") || !bsdf.contains("refs"))
-        continue;
-      std::string base_name = bsdf["name"].get<std::string>();
-      std::string material_name = base_name;
-      int count = name_counts[base_name]++;
-      if (count > 0) {
-        material_name = base_name + "_" + std::to_string(count);
-      }
-      if (bsdf["refs"].is_array()) {
-        for (const auto& ref : bsdf["refs"]) {
-          if (ref.is_string()) {
-            object_to_material_mapping[ref.get<std::string>()] = material_name;
-          }
+  if (options & SceneRepresentation::SetupCamera) {
+    if (data.cameras.empty()) {
+      if ((load_result & SceneLoadCameraInfo) == 0) {
+        if (use_focal_len) {
+          camera_fov = focal_length_to_fov(camera_focal_len) * 180.0f / kPi;
         }
+        build_camera(camera, camera.position, camera.direction, camera.up, camera.film_size, camera_fov);
+        needs_camera_positioning = true;
       }
-    }
-
-    // Use the same directory as the original JSON file
-    std::filesystem::path original_path(filename);
-    std::filesystem::path original_dir = original_path.parent_path();
-
-    // Create materials file with consistent name (overwrite if exists)
-    std::filesystem::path materials_file_path = original_dir / (original_path.stem().string() + ".materials");
-    std::ofstream materials_file(materials_file_path);
-    if (materials_file.is_open()) {
-      materials_file << materials_content;
-      materials_file.close();
-      // Store relative path - base_folder will be prepended later during JSON parsing
-      native_json["materials"] = (original_path.stem().string() + ".materials");
-    }
-
-    // Save the converted JSON with consistent name (overwrite if exists)
-    std::filesystem::path converted_json_path = original_dir / (original_path.stem().string() + "_converted.json");
-    std::ofstream converted_json_file(converted_json_path);
-    if (converted_json_file.is_open()) {
-      converted_json_file << native_json.dump(2);
-      converted_json_file.close();
-      log::info("Saved converted JSON to: %s", converted_json_path.generic_string().c_str());
-    }
-  }
-
-  return {native_json, object_to_material_mapping};
-}
-
-std::string SceneRepresentationImpl::convert_alternative_materials_to_native(const nlohmann::json& bsdfs) {
-  std::stringstream ss;
-  std::map<std::string, int> name_counts;
-
-  for (const auto& bsdf : bsdfs) {
-    if (!bsdf.contains("name") || !bsdf.contains("type")) {
-      continue;
-    }
-
-    std::string base_name = bsdf["name"].get<std::string>();
-    std::string name = base_name;
-    int count = name_counts[base_name]++;
-    if (count > 0) {
-      name = base_name + "_" + std::to_string(count);
-    }
-    std::string type = bsdf["type"].get<std::string>();
-
-    ss << "newmtl " << name << "\n";
-
-    // Map BSDF type to material class
-    if (type == "diffuse") {
-      ss << "material class diffuse\n";
-    } else if (type == "dielectric") {
-      ss << "material class dielectric\n";
-    } else if (type == "conductor") {
-      ss << "material class conductor\n";
-      ss << "int_ior silver\n";  // Set silver IOR for conductors
-      ss << "ext_ior 1.0\n";
-    } else if (type == "mirror") {
-      ss << "material class mirror\n";
     } else {
-      ss << "material class diffuse\n";  // Default fallback
-    }
-
-    // Handle albedo/color - different handling based on material type
-    if (bsdf.contains("albedo") && bsdf["albedo"].is_array() && bsdf["albedo"].size() >= 3) {
-      auto albedo = bsdf["albedo"];
-      if (type == "diffuse") {
-        // For diffuse materials, albedo is the diffuse color
-        ss << "Kd " << albedo[0].get<float>() << " " << albedo[1].get<float>() << " " << albedo[2].get<float>() << "\n";
-      } else if (type == "conductor") {
-        // For conductors, albedo is ignored - we use reflectance/reflectivity for specular color
-        // Conductors don't have diffuse color
-      } else {
-        // For other materials (dielectric, etc.), use albedo as diffuse
-        ss << "Kd " << albedo[0].get<float>() << " " << albedo[1].get<float>() << " " << albedo[2].get<float>() << "\n";
-        ss << "Ks 1.000000 1.000000 1.000000\n";  // Default specular
-      }
-    }
-
-    // Handle IOR for dielectric
-    if (type == "dielectric" && bsdf.contains("ior")) {
-      float ior = bsdf["ior"].get<float>();
-      ss << "int_ior " << ior << "\n";
-      ss << "ext_ior 1.0\n";
-    }
-
-    // Handle roughness for conductors and dielectrics (use Pr parameter as expected by parser)
-    if ((type == "conductor" || type == "dielectric") && bsdf.contains("roughness")) {
-      float roughness = bsdf["roughness"].get<float>();
-      ss << "Pr " << roughness << "\n";
-    }
-
-    // Handle emissive materials
-    if (bsdf.contains("emissive_factor") && bsdf["emissive_factor"].is_array() && bsdf["emissive_factor"].size() >= 3) {
-      auto emissive = bsdf["emissive_factor"];
-      ss << "emitter color " << emissive[0].get<float>() << " " << emissive[1].get<float>() << " " << emissive[2].get<float>() << " twosided\n";
-    } else {
-      ss << "emitter color 0.000000 0.000000 0.000000\n";
-    }
-
-    // Handle conductor-specific properties
-    if (type == "conductor") {
-      // Combine reflectance and edge_tint for better color approximation
-      float3 conductor_color = {1.0f, 1.0f, 1.0f};  // Default white
-      bool has_color = false;
-
-      if (bsdf.contains("reflectance") && bsdf["reflectance"].is_array() && bsdf["reflectance"].size() >= 3) {
-        auto refl = bsdf["reflectance"];
-        conductor_color = {refl[0].get<float>(), refl[1].get<float>(), refl[2].get<float>()};
-        has_color = true;
-
-        // If edge_tint is also available, use (1 - reflectance) * (1 - edge_tint) formula
-        if (bsdf.contains("edge_tint") && bsdf["edge_tint"].is_array() && bsdf["edge_tint"].size() >= 3) {
-          auto tint = bsdf["edge_tint"];
-          float3 edge_color = {tint[0].get<float>(), tint[1].get<float>(), tint[2].get<float>()};
-          float3 refl_color = {refl[0].get<float>(), refl[1].get<float>(), refl[2].get<float>()};
-          // Use (1 - reflectance) * (1 - edge_tint) formula
-          float3 one_minus_refl = {1.0f - refl_color.x, 1.0f - refl_color.y, 1.0f - refl_color.z};
-          float3 one_minus_tint = {1.0f - edge_color.x, 1.0f - edge_color.y, 1.0f - edge_color.z};
-          conductor_color = sqrt(max({}, one_minus_refl * one_minus_tint));
-        }
-      } else if (bsdf.contains("reflectivity") && bsdf["reflectivity"].is_array() && bsdf["reflectivity"].size() >= 3) {
-        // Fallback to reflectivity if reflectance is not available
-        auto refl = bsdf["reflectivity"];
-        conductor_color = {refl[0].get<float>(), refl[1].get<float>(), refl[2].get<float>()};
-        has_color = true;
-      }
-
-      if (has_color) {
-        ss << "Ks " << conductor_color.x << " " << conductor_color.y << " " << conductor_color.z << "\n";
-      }
-      // Note: full edge_tint is not supported by the native conductor BSDF
-    }
-
-    ss << "\n";
-  }
-
-  return ss.str();
-}
-
-nlohmann::json SceneRepresentationImpl::convert_alternative_camera_to_native(const nlohmann::json& camera) {
-  nlohmann::json native_camera;
-
-  native_camera["class"] = "perspective";
-  native_camera["viewport"] = {1280, 720};  // Default viewport
-
-  // Convert position + direction + rotation to origin + target + up
-  if (camera.contains("position") && camera["position"].is_array() && camera["position"].size() >= 3 && camera.contains("dir") && camera["dir"].is_array() &&
-      camera["dir"].size() >= 3) {
-    float3 origin = {camera["position"][0].get<float>(), camera["position"][1].get<float>(), camera["position"][2].get<float>()};
-    float3 direction = {camera["dir"][0].get<float>(), camera["dir"][1].get<float>(), camera["dir"][2].get<float>()};
-
-    // Normalize direction and compute target point
-    direction = normalize(direction);
-    float3 target = origin + direction * float3{1.0f, 1.0f, -1.0f};
-
-    native_camera["origin"] = {origin.x, origin.y, origin.z};
-    native_camera["target"] = {target.x, target.y, target.z};
-    native_camera["up"] = {0.0f, 1.0f, 0.0f};  // Default up vector
-
-    // TODO: Properly handle rotation for up vector calculation
-  }
-
-  if (camera.contains("fov")) {
-    native_camera["fov"] = camera["fov"].get<float>();
-  }
-
-  native_camera["lens-radius"] = 0.0f;
-  native_camera["focal-distance"] = 0.0f;
-
-  return native_camera;
-}
-
-nlohmann::json SceneRepresentationImpl::convert_alternative_integrator_to_native(const nlohmann::json& integrator) {
-  nlohmann::json native_integrator;
-
-  if (integrator.contains("type")) {
-    std::string type = integrator["type"].get<std::string>();
-
-    // Map integrator types
-    if (type == "sppm") {
-      native_integrator["selected"] = "bidirectional";  // Closest match for SPPM
-    } else {
-      native_integrator["selected"] = "path_tracing";  // Default fallback
-    }
-
-    // Convert integrator-specific settings
-    if (type == "sppm") {
-      native_integrator["settings"] = {{"bidirectional", {{"enable_vm", integrator.contains("enable_vm") ? integrator["enable_vm"].get<int>() : 1},
-                                                           {"radius_factor", integrator.contains("radius_factor") ? integrator["radius_factor"].get<float>() : 0.025f},
-                                                           {"base_radius", integrator.contains("base_radius") ? integrator["base_radius"].get<float>() : 0.0325f},
-                                                           {"path_length", integrator.contains("path_length") ? integrator["path_length"].get<int>() : 0}}}};
+      auto it = std::find_if(data.cameras.begin(), data.cameras.end(), [](const auto& e) {
+        return e.active;
+      });
+      const auto& selected = (it != data.cameras.end()) ? *it : data.cameras.front();
+      camera = selected.cam;
     }
   }
 
-  return native_integrator;
+  // Check if there are any emissive materials that will create area emitters
+  bool has_emissive_materials = false;
+  for (const auto& material : data.materials) {
+    if ((material.emission.spectrum_index != kInvalidIndex) && (material.emission.spectrum_index < data.spectrum_values.size()) &&
+        (data.spectrum_values[material.emission.spectrum_index].luminance() > 0.0f)) {
+      has_emissive_materials = true;
+      break;
+    }
+  }
+
+  if (data.emitter_profiles.empty() && !has_emissive_materials) {
+    MaterialDefinition default_atmosphere{
+      "et::atmosphere",
+      {
+        {"direction", "0.0 2.0 1.0"},
+        {"quality", ETX_DEBUG ? "0.0625" : "0.125"},
+        {"angular_diameter", "0.5422"},
+        {"anisotropy", "0.825"},
+        {"altitude", "1000.0"},
+        {"scale", "1.0"},
+        {"sky_scale", "1.0"},
+        {"sun_scale", "1.0"},
+        {"rayleigh", "1.0"},
+        {"mie", "1.0"},
+        {"ozone", "1.0"},
+      },
+    };
+
+    SceneSerialization serialization;
+    serialization.parse_material_definitions(base_folder, {default_atmosphere}, data, context, scene, ior_database, scheduler);
+    context.images.load_images();
+  }
+
+  validate_materials();
+  validate_mediums();
+
+  {
+    TimeMeasure m = {};
+    log::warning("Validating normals and tangents...");
+    bool has_invalid_tangents = false;
+    std::vector<bool> referenced_vertices;
+    validate_normals(referenced_vertices, has_invalid_tangents);
+    log::warning("Normals validated: %.2f sec", m.lap());
+    build_tangents();
+    log::warning("Tangents built: %.2f sec", m.lap());
+    validate_tangents(referenced_vertices, has_invalid_tangents || force_tangents);
+    log::warning("Tangents validated: %.2f sec", m.lap());
+  }
+
+  update_medium_bounds();
+  commit(spectral_scene);
+
+  if (needs_camera_positioning) {
+    constexpr float3 kDefaultViewDirection = {1.0f, 1.0f, 1.0f};
+    float3 position = {};
+    float3 target = {};
+    compute_camera_position_to_fit_scene(scene, camera, kDefaultViewDirection, position, target);
+    const float3 direction = normalize(target - position);
+    build_camera(camera, position, direction, kWorldUp, camera.film_size, camera_fov);
+  }
+
+  return true;
 }
 
 }  // namespace etx
