@@ -4,6 +4,7 @@
 #include <etx/render/shared/base.hxx>
 #include <etx/render/shared/math.hxx>
 #include <etx/render/shared/scene.hxx>
+#include <etx/render/shared/scattering.hxx>
 #include <etx/render/shared/spectrum.hxx>
 #include <etx/render/host/scene_tungsten_loader.hxx>
 #include <etx/render/host/scene_obj_loader.hxx>
@@ -147,6 +148,18 @@ struct TungstenConductorIOR {
   float3 k;
 };
 
+struct PrimitiveLoadResult {
+  bool loaded = false;
+  uint32_t flags = 0u;
+};
+
+bool add_builtin_quad(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data);
+bool add_builtin_cube(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data);
+bool load_wo3_mesh(const std::string& resolved, const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data,
+  bool recompute_normals);
+void transform_vertices(SceneData& data, uint32_t vertex_start, uint32_t vertex_end, const float3& rotation_deg, const float3& scale, const float3& translate);
+void recompute_mesh_bounds(SceneData& data, uint32_t mesh_start, uint32_t mesh_end);
+
 static const TungstenConductorIOR kTungstenConductors[] = {
   {"a-C", {2.9440999183f, 2.2271502925f, 1.9681668794f}, {0.8874329109f, 0.7993216383f, 0.8152862927f}},
   {"Ag", {0.1552646489f, 0.1167232965f, 0.1383806959f}, {4.8283433224f, 3.1222459278f, 2.1469504455f}},
@@ -206,6 +219,178 @@ bool find_tungsten_conductor(const std::string& name, TungstenConductorIOR& out)
     }
   }
   return false;
+}
+
+PrimitiveLoadResult handle_infinite_sphere(const nlohmann::json& prim, const char* base_dir, SceneData& data, SceneLoaderContext& context) {
+  PrimitiveLoadResult r = {};
+  std::string emission = prim.value("emission", "");
+  bool sample = prim.value("sample", true);
+  if (emission.empty() == false && sample) {
+    std::string img_path = resolve_path(base_dir, emission);
+    uint32_t img_idx = context.add_image(img_path.c_str(), Image::BuildSamplingTable | Image::RepeatU, {}, {1.0f, 1.0f});
+    uint32_t sp_white = data.add_spectrum(SpectralDistribution::rgb_reflectance({1.0f, 1.0f, 1.0f}));
+
+    auto& profile = data.emitter_profiles.emplace_back(EmitterProfile::Class::Environment);
+    profile.emission.spectrum_index = sp_white;
+    profile.emission.image_index = img_idx;
+    profile.medium_index = kInvalidIndex;
+
+    auto& inst = data.emitter_instances.emplace_back(EmitterProfile::Class::Environment);
+    inst.profile = static_cast<uint32_t>(data.emitter_profiles.size() - 1);
+    inst.triangle_index = kInvalidIndex;
+    inst.additional_weight = 0.0f;
+
+    r.loaded = true;
+  } else {
+    log::warning("Skipping Tungsten infinite_sphere without emission or sample=false");
+  }
+  return r;
+}
+
+PrimitiveLoadResult handle_infinite_sphere_cap(const nlohmann::json& prim, SceneData& data) {
+  PrimitiveLoadResult r = {};
+  bool sample = prim.value("sample", true);
+  if (sample == false) {
+    log::warning("Skipping Tungsten infinite_sphere_cap with sample=false");
+    return r;
+  }
+
+  float power = prim.value("power", 1.0f);
+  float cap_angle = prim.value("cap_angle", 0.0f);
+
+  float3 rotation = {};
+  if (prim.contains("transform") && prim["transform"].is_object()) {
+    const auto& tr = prim["transform"];
+    if (tr.contains("rotation"))
+      rotation = json_to_float3(tr["rotation"], {});
+  }
+
+  float3 direction = rotate_yxz_deg(float3{0.0f, 1.0f, 0.0f}, rotation);
+  direction = normalize(direction);
+
+  auto& inst = data.emitter_instances.emplace_back(EmitterProfile::Class::Directional);
+  inst.profile = static_cast<uint32_t>(data.emitter_profiles.size());
+
+  auto& d = data.emitter_profiles.emplace_back(EmitterProfile::Class::Directional);
+  d.emission.spectrum_index = data.add_spectrum(SpectralDistribution::rgb_luminance({power, power, power}));
+  d.emission.image_index = kInvalidIndex;
+  d.direction = direction;
+  d.angular_size = 2.0f * cap_angle * kPi / 180.0f;
+
+  r.loaded = true;
+  return r;
+}
+
+PrimitiveLoadResult handle_skydome(const nlohmann::json& prim, SceneData& data, SceneLoaderContext& context, TaskScheduler& scheduler) {
+  constexpr uint32_t kSkyImageBaseDimensions = 256u;
+  constexpr uint2 sky_image_dimensions = uint2{kSkyImageBaseDimensions, 2u * kSkyImageBaseDimensions};
+
+  PrimitiveLoadResult r = {};
+  float temperature = prim.value("temperature", 5777.0f);
+  float intensity = prim.value("intensity", 2.0f);
+  float turbidity = prim.value("turbidity", 3.0f);
+  float3 rotation = {};
+  if (prim.contains("transform") && prim["transform"].is_object()) {
+    const auto& tr = prim["transform"];
+    if (tr.contains("rotation"))
+      rotation = json_to_float3(tr["rotation"], {});
+  }
+
+  float3 sun_dir = normalize(rotate_yxz_deg(float3{0.0f, 1.0f, 0.0f}, rotation));
+  const float sun_angular_diameter_deg = 0.53f;
+  const float angular_size = sun_angular_diameter_deg * kPi / 180.0f;
+
+  scattering::Parameters scattering_parameters = {};
+  scattering_parameters.mie_scale = turbidity / 3.0f;  // Tungsten default turbidity is 3
+
+  SpectralDistribution sun_spectrum = SpectralDistribution::from_normalized_black_body(temperature, intensity);
+
+  uint32_t profile_index = static_cast<uint32_t>(data.emitter_profiles.size());
+  auto& e = data.emitter_profiles.emplace_back(EmitterProfile::Class::Environment);
+  e.emission.spectrum_index = data.add_spectrum(sun_spectrum);
+  e.emission.image_index = context.add_image(nullptr, sky_image_dimensions, Image::BuildSamplingTable | Image::Delay, {}, {1.0f, 1.0f});
+  e.direction = sun_dir;
+  e.medium_index = kInvalidIndex;
+
+  auto& img = context.images.get(e.emission.image_index);
+  scattering::generate_sky_image(scattering_parameters, sky_image_dimensions, sun_dir, data.atmosphere_extinction, img.pixels.f32.a, context.scattering_spectrums, scheduler);
+
+  auto& inst = data.emitter_instances.emplace_back(EmitterProfile::Class::Environment);
+  inst.profile = profile_index;
+  inst.triangle_index = kInvalidIndex;
+
+  r.loaded = true;
+  return r;
+}
+
+PrimitiveLoadResult handle_builtin_primitive(const std::string& type, const float3& translate, const float3& scale, const float3& rotation, uint32_t material_index,
+  SceneData& data) {
+  PrimitiveLoadResult r = {};
+  if (type == "quad") {
+    r.loaded = add_builtin_quad(translate, scale, rotation, material_index, data);
+  } else if (type == "cube") {
+    r.loaded = add_builtin_cube(translate, scale, rotation, material_index, data);
+  } else if (type != "mesh") {
+    log::warning("Unsupported Tungsten primitive type: %s", type.c_str());
+  }
+  return r;
+}
+
+PrimitiveLoadResult handle_mesh_primitive(const nlohmann::json& prim, const char* base_dir, const std::string& type, const float3& translate, const float3& scale,
+  const float3& rotation, uint32_t material_index, SceneData& data, SceneLoaderContext& context, Scene& scene, const IORDatabase& database, TaskScheduler& scheduler,
+  Camera& active_camera) {
+  PrimitiveLoadResult r = {};
+
+  if (type != "mesh")
+    return r;
+
+  uint32_t vertex_start = static_cast<uint32_t>(data.vertices.pos.size());
+  uint32_t triangle_start = static_cast<uint32_t>(data.triangles.size());
+  uint32_t mesh_start = static_cast<uint32_t>(data.meshes.size());
+  (void)triangle_start;
+
+  std::string fname = prim.value("filename", "");
+  if (fname.empty() && prim.contains("file"))
+    fname = prim["file"].get<std::string>();
+  std::string resolved = resolve_path(base_dir, fname);
+  if (resolved.empty()) {
+    log::warning("Tungsten mesh has no filename, skipping");
+    return r;
+  }
+
+  const char* ext = get_ext(resolved);
+  bool loader_applied_transform = false;
+  if (_stricmp(ext, ".obj") == 0) {
+    uint32_t flags = load_from_obj_file(resolved.c_str(), "", data, context, scene, database, scheduler);
+    r.loaded = (flags & SceneLoadSucceeded) != 0u;
+    r.flags |= (flags & ~SceneLoadSucceeded);
+  } else if (_stricmp(ext, ".gltf") == 0) {
+    uint32_t flags = load_from_gltf_file(resolved.c_str(), false, data, context, scene, scheduler, active_camera);
+    r.loaded = (flags & SceneLoadSucceeded) != 0u;
+    r.flags |= (flags & ~SceneLoadSucceeded);
+  } else if (_stricmp(ext, ".glb") == 0) {
+    uint32_t flags = load_from_gltf_file(resolved.c_str(), true, data, context, scene, scheduler, active_camera);
+    r.loaded = (flags & SceneLoadSucceeded) != 0u;
+    r.flags |= (flags & ~SceneLoadSucceeded);
+  } else if (_stricmp(ext, ".wo3") == 0) {
+    bool recompute_normals = prim.value("recompute_normals", false);
+    loader_applied_transform = true;
+    r.loaded = load_wo3_mesh(resolved, translate, scale, rotation, material_index, data, recompute_normals);
+  } else {
+    log::warning("Unsupported Tungsten mesh format: %s", resolved.c_str());
+  }
+
+  if (r.loaded) {
+    uint32_t vertex_end = static_cast<uint32_t>(data.vertices.pos.size());
+    if (loader_applied_transform == false)
+      transform_vertices(data, vertex_start, vertex_end, rotation, scale, translate);
+
+    uint32_t mesh_end = static_cast<uint32_t>(data.meshes.size());
+    if (mesh_end > mesh_start)
+      recompute_mesh_bounds(data, mesh_start, mesh_end);
+  }
+
+  return r;
 }
 
 void set_conductor_ior(Material& mtl, const std::string& material_name, SceneData& data, const IORDatabase& database) {
@@ -278,10 +463,10 @@ uint32_t add_tungsten_material(const std::string& name, const nlohmann::json& b,
     tungsten_set_albedo(mtl, tungsten_albedo_json(b), data, context, base_dir);
     float rough = b.value("roughness", 0.0f);
     mtl.roughness.value = {rough, rough};
-  } else if (type == "rough_plastic") {
+  } else if ((type == "plastic") || (type == "rough_plastic")) {
     mtl.cls = Material::Class::Plastic;
     tungsten_set_albedo(mtl, tungsten_albedo_json(b), data, context, base_dir);
-    float rough = b.value("roughness", 0.2f);
+    float rough = b.value("roughness", 0.0f);
     mtl.roughness.value = {rough, rough};
     mtl.metalness.value = {0.0f, 0.0f};
     mtl.reflectance.image_index = kInvalidIndex;
@@ -296,24 +481,16 @@ uint32_t add_tungsten_material(const std::string& name, const nlohmann::json& b,
     mtl.cls = Material::Class::Thinfilm;
     tungsten_set_albedo(mtl, tungsten_albedo_json(b), data, context, base_dir);
     set_dielectric_ior(mtl, name, b, data, database);
-  } else if (type == "rough_conductor") {
+  } else if ((type == "conductor") || (type == "rough_conductor")) {
     mtl.cls = Material::Class::Conductor;
     tungsten_set_albedo(mtl, tungsten_albedo_json(b), data, context, base_dir);
-    float rough = b.value("roughness", 0.1f);
+    float rough = b.value("roughness", 0.0f);
     mtl.roughness.value = {rough, rough};
     mtl.metalness.value = {1.0f, 1.0f};
     std::string mat_name = b.value("material", "");
     if (mat_name.empty() == false)
       set_conductor_ior(mtl, mat_name, data, database);
-  } else if (type == "conductor") {
-    mtl.cls = Material::Class::Conductor;
-    tungsten_set_albedo(mtl, tungsten_albedo_json(b), data, context, base_dir);
-    mtl.roughness.value = {0.0f, 0.0f};
-    mtl.metalness.value = {1.0f, 1.0f};
-    std::string mat_name = b.value("material", "");
-    if (mat_name.empty() == false)
-      set_conductor_ior(mtl, mat_name, data, database);
-  } else if (type == "dielectric") {
+  } else if ((type == "dielectric") || (type == "rough_dielectric")) {
     mtl.cls = Material::Class::Dielectric;
     set_dielectric_ior(mtl, name, b, data, database);
     mtl.transmission.value = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -365,6 +542,87 @@ float triangles_area(const SceneData& data, uint32_t tri_start, uint32_t tri_end
   for (uint32_t i = tri_start; i < end; ++i)
     area += triangle_area(data.triangles[i], data.vertices.pos);
   return area;
+}
+
+void transform_vertices(SceneData& data, uint32_t vertex_start, uint32_t vertex_end, const float3& rotation_deg, const float3& scale, const float3& translate) {
+  if (vertex_end <= vertex_start)
+    return;
+
+  bool has_rotation = (rotation_deg.x != 0.0f) || (rotation_deg.y != 0.0f) || (rotation_deg.z != 0.0f);
+  bool has_scale = (scale.x != 1.0f) || (scale.y != 1.0f) || (scale.z != 1.0f);
+  bool has_translate = (translate.x != 0.0f) || (translate.y != 0.0f) || (translate.z != 0.0f);
+  if ((has_rotation == false) && (has_scale == false) && (has_translate == false))
+    return;
+
+  for (uint32_t i = vertex_start; i < vertex_end; ++i) {
+    float3 p = data.vertices.pos[i];
+    if (has_scale) {
+      p.x *= scale.x;
+      p.y *= scale.y;
+      p.z *= scale.z;
+    }
+    if (has_rotation)
+      p = rotate_yxz_deg(p, rotation_deg);
+    if (has_translate)
+      p += translate;
+    data.vertices.pos[i] = p;
+
+    float3 n = data.vertices.nrm[i];
+    if (has_rotation)
+      n = rotate_yxz_deg(n, rotation_deg);
+    float ln = length(n);
+    if (ln > kEpsilon)
+      n /= ln;
+    data.vertices.nrm[i] = n;
+
+    float3 t = data.vertices.tan[i];
+    if (has_rotation)
+      t = rotate_yxz_deg(t, rotation_deg);
+    float lt = length(t);
+    if (lt > kEpsilon)
+      t /= lt;
+    data.vertices.tan[i] = t;
+
+    float3 b = data.vertices.btn[i];
+    if (has_rotation)
+      b = rotate_yxz_deg(b, rotation_deg);
+    float lb = length(b);
+    if (lb > kEpsilon)
+      b /= lb;
+    data.vertices.btn[i] = b;
+  }
+}
+
+void recompute_mesh_bounds(SceneData& data, uint32_t mesh_start, uint32_t mesh_end) {
+  uint32_t mesh_count = static_cast<uint32_t>(data.meshes.size());
+  if (mesh_start >= mesh_count)
+    return;
+  if (mesh_end > mesh_count)
+    mesh_end = mesh_count;
+
+  for (uint32_t m = mesh_start; m < mesh_end; ++m) {
+    auto& mesh = data.meshes[m];
+    uint32_t tri_begin = mesh.triangle_offset;
+    uint32_t tri_end = tri_begin + mesh.triangle_count;
+    uint32_t tri_count = static_cast<uint32_t>(data.triangles.size());
+    if (tri_end > tri_count)
+      tri_end = tri_count;
+
+    float3 bbox_min = {kMaxFloat, kMaxFloat, kMaxFloat};
+    float3 bbox_max = {-kMaxFloat, -kMaxFloat, -kMaxFloat};
+
+    for (uint32_t t = tri_begin; t < tri_end; ++t) {
+      const Triangle& tri = data.triangles[t];
+      for (uint32_t k = 0; k < 3; ++k) {
+        const float3& p = data.vertices.pos[tri.i[k]];
+        bbox_min = min(bbox_min, p);
+        bbox_max = max(bbox_max, p);
+      }
+    }
+
+    mesh.bbox_min = bbox_min;
+    mesh.bbox_max = bbox_max;
+  }
 }
 
 void set_emission_from_json(Material& mtl, const nlohmann::json& v, SceneData& data, SceneLoaderContext& context, const char* base_dir, float scale = 1.0f) {
@@ -651,7 +909,8 @@ void recompute_vertex_normals(SceneData& data, uint32_t vertex_start, uint32_t v
   }
 }
 
-bool load_wo3_mesh(const std::string& resolved, const float3& translate, const float3& scale, uint32_t material_index, SceneData& data, bool recompute_normals) {
+bool load_wo3_mesh(const std::string& resolved, const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data,
+  bool recompute_normals) {
   std::ifstream fin(resolved, std::ios::binary);
   if (fin.good() == false) {
     log::warning("Failed to open Tungsten mesh %s", resolved.c_str());
@@ -706,8 +965,13 @@ bool load_wo3_mesh(const std::string& resolved, const float3& translate, const f
 
   for (const auto& v : vbuf) {
     float3 pos = {v.px * scale.x, v.py * scale.y, v.pz * scale.z};
+    pos = rotate_yxz_deg(pos, rotation_deg);
     pos += translate;
     float3 nrm = {v.nx, v.ny, v.nz};
+    nrm = rotate_yxz_deg(nrm, rotation_deg);
+    float ln = length(nrm);
+    if (ln > kEpsilon)
+      nrm /= ln;
     float2 uv = {v.u, 1.0f - v.v};
     data.vertices.pos.emplace_back(pos);
     data.vertices.nrm.emplace_back(nrm);
@@ -751,37 +1015,35 @@ bool load_wo3_mesh(const std::string& resolved, const float3& translate, const f
 
 uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir, const std::unordered_map<std::string, uint32_t>& bsdf_to_mat, SceneData& data,
   SceneLoaderContext& context, Scene& scene, const IORDatabase& database, TaskScheduler& scheduler, Camera& active_camera, bool force_two_sided) {
-  uint32_t load_result = SceneLoadFailed;
+  uint32_t load_flags = SceneLoadFailed;
+  bool primitives_loaded = false;
 
   if (js.contains("primitives") == false || js["primitives"].is_array() == false)
-    return load_result;
+    return load_flags;
 
   for (const auto& prim : js["primitives"]) {
     if (prim.is_object() == false)
       continue;
+
     std::string type = prim.value("type", "");
     if (type == "infinite_sphere") {
-      std::string emission = prim.value("emission", "");
-      bool sample = prim.value("sample", true);
-      if (emission.empty() == false && sample) {
-        std::string img_path = resolve_path(base_dir, emission);
-        uint32_t img_idx = context.add_image(img_path.c_str(), Image::BuildSamplingTable | Image::RepeatU, {}, {1.0f, 1.0f});
-        uint32_t sp_white = data.add_spectrum(SpectralDistribution::rgb_reflectance({1.0f, 1.0f, 1.0f}));
+      PrimitiveLoadResult r = handle_infinite_sphere(prim, base_dir, data, context);
+      primitives_loaded = primitives_loaded || r.loaded;
+      load_flags |= r.flags;
+      continue;
+    }
 
-        auto& profile = data.emitter_profiles.emplace_back(EmitterProfile::Class::Environment);
-        profile.emission.spectrum_index = sp_white;
-        profile.emission.image_index = img_idx;
-        profile.medium_index = kInvalidIndex;
+    if (type == "infinite_sphere_cap") {
+      PrimitiveLoadResult r = handle_infinite_sphere_cap(prim, data);
+      primitives_loaded = primitives_loaded || r.loaded;
+      load_flags |= r.flags;
+      continue;
+    }
 
-        auto& inst = data.emitter_instances.emplace_back(EmitterProfile::Class::Environment);
-        inst.profile = static_cast<uint32_t>(data.emitter_profiles.size() - 1);
-        inst.triangle_index = kInvalidIndex;
-        inst.additional_weight = 0.0f;
-
-        load_result |= SceneLoadSucceeded;
-      } else {
-        log::warning("Skipping Tungsten infinite_sphere without emission or sample=false");
-      }
+    if (type == "skydome") {
+      PrimitiveLoadResult r = handle_skydome(prim, data, context, scheduler);
+      primitives_loaded = primitives_loaded || r.loaded;
+      load_flags |= r.flags;
       continue;
     }
 
@@ -848,48 +1110,19 @@ uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir
     uint32_t tri_start = static_cast<uint32_t>(data.triangles.size());
     bool prim_loaded = false;
 
-    if (type == "quad") {
-      prim_loaded = add_builtin_quad(translate, scale, rotation, material_index, data);
-    } else if (type == "cube") {
-      prim_loaded = add_builtin_cube(translate, scale, rotation, material_index, data);
-    } else if (type != "mesh") {
-      log::warning("Unsupported Tungsten primitive type: %s", type.c_str());
+    PrimitiveLoadResult builtin_result = {};
+    if (type != "mesh") {
+      builtin_result = handle_builtin_primitive(type, translate, scale, rotation, material_index, data);
+      prim_loaded = builtin_result.loaded;
     }
 
-    if (type == "mesh") {
-      std::string fname = prim.value("filename", "");
-      if (fname.empty() && prim.contains("file"))
-        fname = prim["file"].get<std::string>();
-      std::string resolved = resolve_path(base_dir, fname);
-      if (resolved.empty()) {
-        log::warning("Tungsten mesh has no filename, skipping");
-      } else {
-        const char* ext = get_ext(resolved);
-        if (_stricmp(ext, ".obj") == 0) {
-          uint32_t flags = load_from_obj_file(resolved.c_str(), "", data, context, scene, database, scheduler);
-          prim_loaded = (flags & SceneLoadSucceeded) != 0u;
-          load_result |= flags;
-        } else if (_stricmp(ext, ".gltf") == 0) {
-          uint32_t flags = load_from_gltf_file(resolved.c_str(), false, data, context, scene, scheduler, active_camera);
-          prim_loaded = (flags & SceneLoadSucceeded) != 0u;
-          load_result |= flags;
-        } else if (_stricmp(ext, ".glb") == 0) {
-          uint32_t flags = load_from_gltf_file(resolved.c_str(), true, data, context, scene, scheduler, active_camera);
-          prim_loaded = (flags & SceneLoadSucceeded) != 0u;
-          load_result |= flags;
-        } else if (_stricmp(ext, ".wo3") == 0) {
-          bool recompute_normals = prim.value("recompute_normals", false);
-          prim_loaded = load_wo3_mesh(resolved, translate, scale, material_index, data, recompute_normals);
-          if (prim_loaded)
-            load_result |= SceneLoadSucceeded;
-        } else {
-          log::warning("Unsupported Tungsten mesh format: %s", resolved.c_str());
-        }
-      }
-    }
+    PrimitiveLoadResult mesh_result =
+      handle_mesh_primitive(prim, base_dir, type, translate, scale, rotation, material_index, data, context, scene, database, scheduler, active_camera);
+    prim_loaded = prim_loaded || mesh_result.loaded;
+    load_flags |= mesh_result.flags;
 
     if (prim_loaded) {
-      load_result |= SceneLoadSucceeded;
+      primitives_loaded = true;
       uint32_t tri_end = static_cast<uint32_t>(data.triangles.size());
       float area = triangles_area(data, tri_start, tri_end);
       if (has_power) {
@@ -907,7 +1140,9 @@ uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir
     }
   }
 
-  return load_result;
+  if (primitives_loaded)
+    load_flags |= SceneLoadSucceeded;
+  return load_flags;
 }
 
 }  // namespace
