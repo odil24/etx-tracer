@@ -172,6 +172,13 @@ void UI::MappingRepresentation::build(const std::unordered_map<std::string, uint
   }
 }
 
+void UI::update_name_buffer(SelectionKind kind, int32_t index, const char* current_name) {
+  if ((_name_edit_selection.kind != kind) || (_name_edit_selection.index != index)) {
+    _name_edit_selection = {kind, index};
+    std::snprintf(_name_edit_buffer, sizeof(_name_edit_buffer), "%s", (current_name != nullptr) ? current_name : "");
+  }
+}
+
 void UI::initialize(Film* film, const IORDatabase* db) {
   _film = film;
   _ior_database = db;
@@ -973,6 +980,21 @@ void UI::build(double dt, const std::vector<std::string>& recent_files, Scene& s
     _mesh_mapping_hash = meshh;
   }
 
+  auto apply_pending_selection = [&](const MappingRepresentation& map, SelectionKind kind) {
+    if ((_pending_selection.has == false) || (_pending_selection.kind != kind)) {
+      return;
+    }
+    auto it = map.reverse.find(_pending_selection.index);
+    if (it != map.reverse.end()) {
+      set_selection(kind, static_cast<int32_t>(it->second), false);
+    }
+  };
+
+  apply_pending_selection(_material_mapping, SelectionKind::Material);
+  apply_pending_selection(_medium_mapping, SelectionKind::Medium);
+  apply_pending_selection(_mesh_mapping, SelectionKind::Mesh);
+  _pending_selection = {};
+
   // Validate selections after mappings are updated
   validate_selections(scene);
 
@@ -1334,7 +1356,7 @@ bool UI::build_material(Scene& scene, Material& material) {
   return changed;
 }
 
-bool UI::build_medium(Scene& scene, Medium& m, const char* name) {
+bool UI::build_medium(Scene& scene, Medium& m) {
   bool changed = false;
 
   if (scene.spectrums.count == 0) {
@@ -1352,10 +1374,6 @@ bool UI::build_medium(Scene& scene, Medium& m, const char* name) {
 
   bool has_density_grid = m.grid.has_data();
   bool recompute_extinction = false;
-
-  if (name != nullptr) {
-    ImGui::Text("%s", name);
-  }
 
   ImGui::Text("Medium Type");
   const char* medium_type_names[] = {"Homogeneous", "Heterogeneous (Noise)"};
@@ -1839,6 +1857,14 @@ void UI::build_scene_objects_window(Scene& scene, const BuildContext& ctx, const
     }
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 20.0f, 0.0f), ImGuiCond_Always);
     if (ImGui::BeginPopup(add_scene_object_popup_id)) {
+      if (ImGui::Selectable("Add Material")) {
+        if (callbacks.material_added) {
+          callbacks.material_added();
+          _material_mapping.build(materials);
+          _material_mapping_hash = hash_mapping(materials);
+        }
+        ImGui::CloseCurrentPopup();
+      }
       if (ImGui::Selectable("Add Medium")) {
         if (callbacks.medium_added) {
           callbacks.medium_added();
@@ -2180,6 +2206,23 @@ void UI::build_material_selection_properties(Scene& scene, const BuildContext& c
   }
   uint32_t material_index = _material_mapping.at(_selection.index);
   Material& material = scene.materials[material_index];
+  const char* material_name = _material_mapping.name(_selection.index);
+  update_name_buffer(SelectionKind::Material, _selection.index, material_name);
+
+  if (!ctx.scene_editable)
+    ImGui::BeginDisabled();
+  ImGui::AlignTextToFramePadding();
+  ImGui::Text("Name");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+  bool name_edit_active = ImGui::InputText("##material_name", _name_edit_buffer, sizeof(_name_edit_buffer), ImGuiInputTextFlags_AutoSelectAll);
+  bool name_commit = ImGui::IsItemDeactivatedAfterEdit() || (name_edit_active && ImGui::IsKeyPressed(ImGuiKey_Enter));
+  if (!ctx.scene_editable)
+    ImGui::EndDisabled();
+  if (ctx.scene_editable && name_commit && callbacks.material_renamed) {
+    callbacks.material_renamed(material_index, std::string(_name_edit_buffer));
+    _pending_selection = {SelectionKind::Material, material_index, true};
+  }
   if (!ctx.scene_editable)
     ImGui::BeginDisabled();
   bool changed = build_material(scene, material);
@@ -2202,9 +2245,24 @@ void UI::build_medium_selection_properties(Scene& scene, const BuildContext& ctx
   uint32_t medium_index = _medium_mapping.at(_selection.index);
   Medium& medium = scene.mediums[medium_index];
   const char* medium_name = _medium_mapping.name(_selection.index);
+  update_name_buffer(SelectionKind::Medium, _selection.index, medium_name);
   if (!ctx.scene_editable)
     ImGui::BeginDisabled();
-  bool changed = build_medium(scene, medium, medium_name);
+  ImGui::AlignTextToFramePadding();
+  ImGui::Text("Name");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+  bool name_edit_active = ImGui::InputText("##medium_name", _name_edit_buffer, sizeof(_name_edit_buffer), ImGuiInputTextFlags_AutoSelectAll);
+  bool name_commit = ImGui::IsItemDeactivatedAfterEdit() || (name_edit_active && ImGui::IsKeyPressed(ImGuiKey_Enter));
+  if (!ctx.scene_editable)
+    ImGui::EndDisabled();
+  if (ctx.scene_editable && name_commit && callbacks.medium_renamed) {
+    callbacks.medium_renamed(medium_index, std::string(_name_edit_buffer));
+    _pending_selection = {SelectionKind::Medium, medium_index, true};
+  }
+  if (!ctx.scene_editable)
+    ImGui::BeginDisabled();
+  bool changed = build_medium(scene, medium);
   if (!ctx.scene_editable)
     ImGui::EndDisabled();
   if (ctx.scene_editable && changed) {
@@ -2393,6 +2451,23 @@ void UI::build_mesh_selection_properties(Scene& scene, const BuildContext& ctx) 
 
   uint32_t mesh_index = _mesh_mapping.at(_selection.index);
   const Mesh& mesh = scene.meshes[mesh_index];
+
+  const char* mesh_name = _mesh_mapping.name(_selection.index);
+  update_name_buffer(SelectionKind::Mesh, _selection.index, mesh_name);
+  if (!ctx.scene_editable)
+    ImGui::BeginDisabled();
+  ImGui::AlignTextToFramePadding();
+  ImGui::Text("Name");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+  bool name_edit_active = ImGui::InputText("##mesh_name", _name_edit_buffer, sizeof(_name_edit_buffer), ImGuiInputTextFlags_AutoSelectAll);
+  bool name_commit = ImGui::IsItemDeactivatedAfterEdit() || (name_edit_active && ImGui::IsKeyPressed(ImGuiKey_Enter));
+  if (!ctx.scene_editable)
+    ImGui::EndDisabled();
+  if (ctx.scene_editable && name_commit && callbacks.mesh_renamed) {
+    callbacks.mesh_renamed(mesh_index, std::string(_name_edit_buffer));
+    _pending_selection = {SelectionKind::Mesh, mesh_index, true};
+  }
 
   ImGui::Text("Triangles: %u", mesh.triangle_count);
 

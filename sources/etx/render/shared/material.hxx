@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <etx/render/shared/base.hxx>
 #include <etx/render/shared/spectrum.hxx>

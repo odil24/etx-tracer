@@ -1,4 +1,4 @@
-﻿#include <etx/core/environment.hxx>
+#include <etx/core/environment.hxx>
 #include <etx/core/environment.hxx>
 #include <etx/core/profiler.hxx>
 
@@ -59,10 +59,14 @@ void RTApplication::init() {
   ui.callbacks.reload_geometry_selected = std::bind(&RTApplication::on_reload_geometry_selected, this);
   ui.callbacks.options_changed = std::bind(&RTApplication::on_options_changed, this);
   ui.callbacks.use_image_as_reference = std::bind(&RTApplication::on_use_image_as_reference, this);
+  ui.callbacks.material_added = std::bind(&RTApplication::on_material_added, this);
+  ui.callbacks.material_renamed = std::bind(&RTApplication::on_material_renamed, this, std::placeholders::_1, std::placeholders::_2);
   ui.callbacks.material_changed = std::bind(&RTApplication::on_material_changed, this, std::placeholders::_1);
   ui.callbacks.medium_added = std::bind(&RTApplication::on_medium_added, this);
+  ui.callbacks.medium_renamed = std::bind(&RTApplication::on_medium_renamed, this, std::placeholders::_1, std::placeholders::_2);
   ui.callbacks.medium_changed = std::bind(&RTApplication::on_medium_changed, this, std::placeholders::_1);
   ui.callbacks.mesh_material_changed = std::bind(&RTApplication::on_mesh_material_changed, this, std::placeholders::_1, std::placeholders::_2);
+  ui.callbacks.mesh_renamed = std::bind(&RTApplication::on_mesh_renamed, this, std::placeholders::_1, std::placeholders::_2);
   ui.callbacks.emitter_changed = std::bind(&RTApplication::on_emitter_changed, this, std::placeholders::_1);
   ui.callbacks.emitter_added = std::bind(&RTApplication::on_emitter_added, this, std::placeholders::_1);
   ui.callbacks.camera_changed = std::bind(&RTApplication::on_camera_changed, this, std::placeholders::_1);
@@ -393,6 +397,17 @@ void RTApplication::on_options_changed() {
   integrator_thread.restart();
 }
 
+void RTApplication::on_material_added() {
+  integrator_thread.stop(Integrator::Stop::Immediate);
+  scene.add_material(nullptr);
+  scene.rebuild_area_emitters();
+  integrator_thread.restart();
+}
+
+void RTApplication::on_material_renamed(uint32_t index, const std::string& name) {
+  scene.rename_material(index, name.c_str());
+}
+
 void RTApplication::on_material_changed(uint32_t index) {
   integrator_thread.stop(Integrator::Stop::Immediate);
   scene.rebuild_area_emitters();
@@ -405,6 +420,10 @@ void RTApplication::on_medium_added() {
   integrator_thread.restart();
 }
 
+void RTApplication::on_medium_renamed(uint32_t index, const std::string& name) {
+  scene.rename_medium(index, name.c_str());
+}
+
 void RTApplication::on_medium_changed(uint32_t index) {
   integrator_thread.restart();
 }
@@ -414,6 +433,10 @@ void RTApplication::on_mesh_material_changed(uint32_t mesh_index, uint32_t mater
   scene.set_mesh_material(mesh_index, material_index);
   scene.rebuild_area_emitters();
   integrator_thread.restart();
+}
+
+void RTApplication::on_mesh_renamed(uint32_t index, const std::string& name) {
+  scene.rename_mesh(index, name.c_str());
 }
 
 void RTApplication::on_emitter_changed(uint32_t index) {

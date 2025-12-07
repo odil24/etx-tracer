@@ -396,7 +396,7 @@ ETX_GPU_CODE SpectralResponse evalPhaseFunction_dielectric(const SpectralQuery s
     return {spect, 0.0f};
 
   float o_dot_m = dot(wo, wh);
-  float scalar = eta * eta * i_dot_m * max(0.0f, -o_dot_m) * D_ggx(wh, alpha)  //
+  float scalar = i_dot_m * max(0.0f, -o_dot_m) * D_ggx(wh, alpha)  //
                  / (projectedArea * sqr(i_dot_m + eta * o_dot_m));
 
   SpectralResponse f = fresnel::calculate(spect, i_dot_m, ext_ior, int_ior, thinfilm);

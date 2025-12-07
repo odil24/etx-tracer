@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <etx/core/core.hxx>
 #include <etx/core/handle.hxx>
@@ -47,10 +47,14 @@ struct RTApplication {
   void on_reload_geometry_selected();
   void on_options_changed();
   void on_use_image_as_reference();
+  void on_material_added();
+  void on_material_renamed(uint32_t index, const std::string&);
   void on_material_changed(uint32_t index);
   void on_medium_added();
+  void on_medium_renamed(uint32_t index, const std::string&);
   void on_medium_changed(uint32_t index);
   void on_mesh_material_changed(uint32_t mesh_index, uint32_t material_index);
+  void on_mesh_renamed(uint32_t index, const std::string&);
   void on_emitter_changed(uint32_t index);
   void on_emitter_added(uint32_t type);
   void on_camera_changed(bool film_changed);

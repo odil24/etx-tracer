@@ -123,6 +123,8 @@ uint32_t load_from_obj_file(const char* obj_file_name, const char* mtl_file_name
         break;
       }
     }
+  } else {
+    materials_to_load = mtl_file_name;
   }
 
   // Load OBJ with appropriate material loading

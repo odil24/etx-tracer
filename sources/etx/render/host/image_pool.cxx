@@ -307,11 +307,18 @@ struct ImagePoolImpl {
     ETX_ASSERT(img.y_distribution.values.count == 0);
     ETX_ASSERT(img.y_distribution.values.a == nullptr);
 
+    const bool skip_loading = (file_name == nullptr) || (file_name[0] == '\0') || ((file_name[0] == '#') && (file_name[1] == '#'));
+
     std::vector<uint8_t> source_data = {};
-    img.format = load_data(file_name, source_data, img.isize);
+
+    if (skip_loading == false) {
+      img.format = load_data(file_name, source_data, img.isize);
+      if ((img.format == Image::Format::Undefined) || (img.isize.x * img.isize.y == 0)) {
+        log::error("Failed to load image from file: %s", file_name);
+      }
+    }
 
     if ((img.format == Image::Format::Undefined) || (img.isize.x * img.isize.y == 0)) {
-      log::error("Failed to load image from file: %s", file_name);
       source_data.resize(sizeof(float4));
       *(float4*)(source_data.data()) = {1.0f, 1.0f, 1.0f, 1.0f};
       img.format = Image::Format::RGBA32F;

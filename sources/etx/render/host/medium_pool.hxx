@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <etx/core/pimpl.hxx>
 #include <etx/render/shared/medium.hxx>
@@ -33,6 +33,8 @@ struct MediumPool {
   const Mapping& mapping() const;
   Medium* as_array();
   uint64_t array_size();
+
+  std::string rename(uint32_t index, const std::string& desired_name);
 
   ETX_DECLARE_PIMPL(MediumPool, 256);
 };

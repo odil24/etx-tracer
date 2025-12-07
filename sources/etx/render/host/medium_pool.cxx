@@ -70,6 +70,57 @@ struct MediumPoolImpl {
     return mediums[handle];
   }
 
+  std::string rename(uint32_t index, const std::string& desired) {
+    if (index >= mediums.size()) {
+      return {};
+    }
+
+    auto current = mapping.end();
+    for (auto it = mapping.begin(); it != mapping.end(); ++it) {
+      if (it->second == index) {
+        current = it;
+        break;
+      }
+    }
+    if (current == mapping.end()) {
+      return {};
+    }
+
+    auto strip_prefix = [](const std::string& s) -> std::string {
+      if (s.starts_with("etx::")) {
+        return s.substr(5);
+      }
+      if (s.starts_with("et::")) {
+        return s.substr(4);
+      }
+      return s;
+    };
+
+    std::string base = strip_prefix(desired);
+    if (base.empty()) {
+      base = current->first;
+    }
+    if (base.empty()) {
+      base = "medium-" + std::to_string(index);
+    }
+
+    std::string final = base;
+    uint32_t suffix = 1;
+    while (true) {
+      auto found = mapping.find(final);
+      if ((found == mapping.end()) || (found->second == index)) {
+        break;
+      }
+      final = base + "#" + std::to_string(suffix++);
+    }
+
+    if (final != current->first) {
+      mapping.erase(current);
+      mapping.emplace(final, index);
+    }
+    return final;
+  }
+
   const Medium& get(uint32_t handle) const {
     ETX_CRITICAL(handle < mediums.size());
     return mediums[handle];
@@ -223,6 +274,10 @@ Medium& MediumPool::get(uint32_t handle) {
 
 const Medium& MediumPool::get(uint32_t handle) const {
   return _private->get(handle);
+}
+
+std::string MediumPool::rename(uint32_t index, const std::string& desired_name) {
+  return _private->rename(index, desired_name);
 }
 
 void MediumPool::remove_all() {

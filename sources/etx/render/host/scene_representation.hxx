@@ -44,7 +44,11 @@ struct SceneRepresentation {
   const MediumMapping& medium_mapping() const;
   const MeshMapping& mesh_mapping() const;
 
+  uint32_t add_material(const char* name = nullptr);
+  std::string rename_material(uint32_t index, const char* name);
   uint32_t add_medium(const char* name = nullptr);
+  std::string rename_medium(uint32_t index, const char* name);
+  std::string rename_mesh(uint32_t index, const char* name);
   void rebuild_area_emitters();
   void set_mesh_material(uint32_t mesh_index, uint32_t material_index);
 

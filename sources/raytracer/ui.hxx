@@ -67,10 +67,14 @@ struct UI {
     std::function<void()> reload_geometry_selected;
     std::function<void()> options_changed;
     std::function<void()> use_image_as_reference;
+    std::function<void()> material_added;
+    std::function<void(uint32_t, const std::string&)> material_renamed;
     std::function<void(uint32_t)> material_changed;
     std::function<void()> medium_added;
+    std::function<void(uint32_t, const std::string&)> medium_renamed;
     std::function<void(uint32_t)> medium_changed;
     std::function<void(uint32_t, uint32_t)> mesh_material_changed;  // mesh_index, new_material_index
+    std::function<void(uint32_t, const std::string&)> mesh_renamed;
     std::function<void(uint32_t)> emitter_changed;
     std::function<void(uint32_t)> emitter_added;  // 0=environment, 1=directional, 2=atmosphere
     std::function<void(bool)> camera_changed;
@@ -107,13 +111,14 @@ struct UI {
   void save_image(SaveImageMode mode) const;
   void load_image() const;
   bool build_material(Scene& scene, Material&);
-  bool build_medium(Scene& scene, Medium&, const char* name);
+  bool build_medium(Scene& scene, Medium&);
   bool spectrum_picker(const char* widget_id, SpectralDistribution& spd, bool linear, bool scale, bool show_color = true, bool show_scale = true);
   bool spectrum_picker(Scene& scene, const char* widget_id, uint32_t spd_index, bool linear, bool scale, bool show_color = true, bool show_scale = true);
   bool angle_editor(const char* label, float2& angles, float min_azimuth, float max_azimuth, float min_elevation, float max_elevation, float pole_threshold);
   bool ior_picker(Scene& scene, const char* name, RefractiveIndex& ior);
   bool emission_picker(Scene& scene, const char* label, const char* id_suffix, uint32_t& spectrum_index);
   bool medium_dropdown(const char* label, uint32_t& medium);
+  void update_name_buffer(SelectionKind kind, int32_t index, const char* current_name);
 
   void reset_selection();
   void reload_geometry();
@@ -208,10 +213,18 @@ struct UI {
     } mode = Mode::Color;
   };
 
+  struct PendingSelection {
+    SelectionKind kind = SelectionKind::None;
+    uint32_t index = kInvalidIndex;
+    bool has = false;
+  } _pending_selection;
+
   MappingRepresentation _material_mapping;
   MappingRepresentation _medium_mapping;
   MappingRepresentation _mesh_mapping;
   SelectionState _selection;
+  SelectionState _name_edit_selection = {};
+  char _name_edit_buffer[256] = {};
   std::vector<SelectionState> _selection_history;
   int32_t _selection_history_cursor = -1;
   uint32_t _ui_setup = UIDefaults;

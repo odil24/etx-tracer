@@ -472,6 +472,7 @@ uint32_t add_tungsten_material(const std::string& name, const nlohmann::json& b,
   bool force_two_sided) {
   uint32_t mat_idx = data.add_material(name.c_str());
   auto& mtl = data.materials[mat_idx];
+  bool two_sided = b.value("two_sided", b.value("twoSided", false));
   std::string type = b.value("type", "lambert");
   mtl.ext_ior.cls = SpectralDistribution::Class::Dielectric;
   mtl.ext_ior.eta_index = data.add_spectrum(SpectralDistribution::constant(1.0f));
@@ -514,7 +515,7 @@ uint32_t add_tungsten_material(const std::string& name, const nlohmann::json& b,
       mtl.thinfilm.ior.k_index = data.add_spectrum(SpectralDistribution::constant(0.0f));
     }
 
-    if (force_two_sided)
+    if (two_sided || force_two_sided)
       mtl.two_sided = 1u;
     return mat_idx;
   }
@@ -581,7 +582,7 @@ uint32_t add_tungsten_material(const std::string& name, const nlohmann::json& b,
     tungsten_set_albedo(mtl, tungsten_albedo_json(b), data, context, base_dir);
   }
 
-  if (force_two_sided)
+  if (two_sided || force_two_sided)
     mtl.two_sided = 1u;
 
   return mat_idx;
@@ -615,6 +616,12 @@ void transform_vertices(SceneData& data, uint32_t vertex_start, uint32_t vertex_
   if ((has_rotation == false) && (has_scale == false) && (has_translate == false))
     return;
 
+  float3 inv_scale = {
+    scale.x != 0.0f ? (1.0f / scale.x) : 0.0f,
+    scale.y != 0.0f ? (1.0f / scale.y) : 0.0f,
+    scale.z != 0.0f ? (1.0f / scale.z) : 0.0f,
+  };
+
   for (uint32_t i = vertex_start; i < vertex_end; ++i) {
     float3 p = data.vertices.pos[i];
     if (has_scale) {
@@ -629,29 +636,64 @@ void transform_vertices(SceneData& data, uint32_t vertex_start, uint32_t vertex_
     data.vertices.pos[i] = p;
 
     float3 n = data.vertices.nrm[i];
+    if (has_scale) {
+      n *= inv_scale;
+    }
     if (has_rotation)
       n = rotate_yxz_deg(n, rotation_deg);
     float ln = length(n);
     if (ln > kEpsilon)
       n /= ln;
-    data.vertices.nrm[i] = n;
+    data.vertices.nrm[i] = normalize(n);
 
     float3 t = data.vertices.tan[i];
+    if (has_scale) {
+      t.x *= scale.x;
+      t.y *= scale.y;
+      t.z *= scale.z;
+    }
     if (has_rotation)
       t = rotate_yxz_deg(t, rotation_deg);
     float lt = length(t);
     if (lt > kEpsilon)
       t /= lt;
-    data.vertices.tan[i] = t;
+    data.vertices.tan[i] = normalize(t);
 
     float3 b = data.vertices.btn[i];
+    if (has_scale) {
+      b.x *= scale.x;
+      b.y *= scale.y;
+      b.z *= scale.z;
+    }
     if (has_rotation)
       b = rotate_yxz_deg(b, rotation_deg);
     float lb = length(b);
     if (lb > kEpsilon)
       b /= lb;
-    data.vertices.btn[i] = b;
+    data.vertices.btn[i] = normalize(b);
   }
+}
+
+void reserve_mesh_vertices(SceneData& data, uint32_t extra_vertices) {
+  size_t required = data.vertices.pos.size() + static_cast<size_t>(extra_vertices);
+  if (data.vertices.pos.capacity() < required)
+    data.vertices.pos.reserve(required);
+  if (data.vertices.nrm.capacity() < required)
+    data.vertices.nrm.reserve(required);
+  if (data.vertices.tan.capacity() < required)
+    data.vertices.tan.reserve(required);
+  if (data.vertices.btn.capacity() < required)
+    data.vertices.btn.reserve(required);
+  if (data.vertices.tex.capacity() < required)
+    data.vertices.tex.reserve(required);
+}
+
+void reserve_mesh_triangles(SceneData& data, uint32_t extra_triangles) {
+  size_t required = data.triangles.size() + static_cast<size_t>(extra_triangles);
+  if (data.triangles.capacity() < required)
+    data.triangles.reserve(required);
+  if (data.triangle_to_emitter.capacity() < required)
+    data.triangle_to_emitter.reserve(required);
 }
 
 void recompute_mesh_bounds(SceneData& data, uint32_t mesh_start, uint32_t mesh_end) {
@@ -1318,6 +1360,20 @@ void load_tungsten_media(const nlohmann::json& js, SceneData& data, SceneLoaderC
   }
 }
 
+uint32_t count_tungsten_meshes(const nlohmann::json& js) {
+  if (js.contains("primitives") == false || js["primitives"].is_array() == false)
+    return 0u;
+  uint32_t count = 0;
+  for (const auto& prim : js["primitives"]) {
+    if (prim.is_object() == false)
+      continue;
+    std::string type = prim.value("type", "");
+    if (type == "mesh")
+      ++count;
+  }
+  return count;
+}
+
 uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir, const std::unordered_map<std::string, uint32_t>& bsdf_to_mat, SceneData& data,
   SceneLoaderContext& context, Scene& scene, const IORDatabase& database, TaskScheduler& scheduler, Camera& active_camera, bool force_two_sided) {
   uint32_t load_flags = SceneLoadFailed;
@@ -1507,6 +1563,14 @@ uint32_t load_from_tungsten_file(const char* file_name, SceneData& data, SceneLo
   bool camera_loaded = load_tungsten_camera(js, data, active_camera);
 
   load_tungsten_media(js, data, context, scene);
+
+  uint32_t mesh_count = count_tungsten_meshes(js);
+  if (mesh_count > 0) {
+    constexpr uint32_t kMeshVertexReserve = 1024u;
+    constexpr uint32_t kMeshTriangleReserve = 2048u;
+    reserve_mesh_vertices(data, mesh_count * kMeshVertexReserve);
+    reserve_mesh_triangles(data, mesh_count * kMeshTriangleReserve);
+  }
 
   uint32_t load_result = load_tungsten_primitives(js, base_dir, bsdf_to_mat, data, context, scene, database, scheduler, active_camera, force_two_sided);
 

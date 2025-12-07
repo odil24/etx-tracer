@@ -29,6 +29,57 @@
 
 namespace etx {
 
+namespace {
+
+std::string rename_entry(std::unordered_map<std::string, uint32_t>& mapping, uint32_t index, const char* desired_name, const char* fallback_prefix) {
+  auto current = mapping.end();
+  for (auto it = mapping.begin(); it != mapping.end(); ++it) {
+    if (it->second == index) {
+      current = it;
+      break;
+    }
+  }
+  if (current == mapping.end()) {
+    return {};
+  }
+
+  std::string base = (desired_name != nullptr) ? desired_name : "";
+  auto strip_prefix = [](const std::string& s) -> std::string {
+    if (s.starts_with("etx::")) {
+      return s.substr(5);
+    }
+    if (s.starts_with("et::")) {
+      return s.substr(4);
+    }
+    return s;
+  };
+  base = strip_prefix(base);
+  if (base.empty()) {
+    base = current->first;
+  }
+  if (base.empty()) {
+    base = std::string(fallback_prefix) + std::to_string(index);
+  }
+
+  std::string final = base;
+  uint32_t suffix = 1;
+  while (true) {
+    auto found = mapping.find(final);
+    if ((found == mapping.end()) || (found->second == index)) {
+      break;
+    }
+    final = base + "#" + std::to_string(suffix++);
+  }
+
+  if (final != current->first) {
+    mapping.erase(current);
+    mapping.emplace(final, index);
+  }
+  return final;
+}
+
+}  // namespace
+
 void material_class_to_string(Material::Class cls, const char** str) {
   static const char* names[] = {
     "diffuse",
@@ -603,11 +654,45 @@ const SceneRepresentation::MeshMapping& SceneRepresentation::mesh_mapping() cons
   return _private->data.mesh_mapping;
 }
 
+uint32_t SceneRepresentation::add_material(const char* name) {
+  uint32_t index = _private->data.add_material(name);
+  auto& mat = _private->data.materials[index];
+  mat.cls = Material::Class::Diffuse;
+  mat.reflectance.spectrum_index = _private->data.add_spectrum(SpectralDistribution::rgb_reflectance({1.0f, 1.0f, 1.0f}));
+  mat.scattering.spectrum_index = _private->data.add_spectrum(SpectralDistribution::rgb_reflectance({1.0f, 1.0f, 1.0f}));
+  mat.emission.spectrum_index = _private->data.add_spectrum(SpectralDistribution::constant(0.0f));
+  mat.subsurface.spectrum_index = _private->data.add_spectrum(SpectralDistribution::rgb_reflectance({1.0f, 0.2f, 0.04f}));
+  mat.int_ior.eta_index = _private->scene.default_dielectric_eta;
+  mat.int_ior.k_index = _private->scene.default_conductor_k;
+  mat.ext_ior.eta_index = _private->scene.default_dielectric_eta;
+  mat.ext_ior.k_index = _private->scene.default_conductor_k;
+  _private->scene.materials = {_private->data.materials.data(), _private->data.materials.size()};
+  return index;
+}
+
+std::string SceneRepresentation::rename_material(uint32_t index, const char* name) {
+  auto result = rename_entry(_private->data.material_mapping, index, name, "material-");
+  _private->scene.materials = {_private->data.materials.data(), _private->data.materials.size()};
+  return result;
+}
+
 uint32_t SceneRepresentation::add_medium(const char* name) {
   SpectralDistribution null_spectrum = SpectralDistribution::null();
   uint32_t handle = _private->context.add_medium(_private->scene, _private->data, Medium::Class::Homogeneous, name, nullptr, null_spectrum, null_spectrum, 0.0f, true);
   _private->scene.mediums = {_private->context.mediums.as_array(), _private->context.mediums.array_size()};
   return handle;
+}
+
+std::string SceneRepresentation::rename_medium(uint32_t index, const char* name) {
+  auto result = _private->context.mediums.rename(index, (name != nullptr) ? name : "");
+  _private->scene.mediums = {_private->context.mediums.as_array(), _private->context.mediums.array_size()};
+  return result;
+}
+
+std::string SceneRepresentation::rename_mesh(uint32_t index, const char* name) {
+  auto result = rename_entry(_private->data.mesh_mapping, index, name, "mesh-");
+  _private->scene.meshes = {_private->data.meshes.data(), _private->data.meshes.size()};
+  return result;
 }
 
 void SceneRepresentation::rebuild_area_emitters() {

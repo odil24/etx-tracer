@@ -1,4 +1,4 @@
-﻿namespace etx {
+namespace etx {
 
 namespace ThinfilmBSDF {
 
@@ -133,9 +133,8 @@ ETX_GPU_CODE BSDFSample sample(const BSDFData& data, const Material& mtl, const 
     result.medium_index = data.current_medium;
   } else {
     float eta = (int_ior.eta / ext_ior.eta).monochromatic();
-    float factor = sqr(1.0f / eta);
     result.eta = eta;
-    result.weight = (result.weight / result.weight.monochromatic()) * apply_image(data.spectrum_sample, mtl.scattering, data.tex, scene, nullptr) * factor;
+    result.weight = (result.weight / result.weight.monochromatic()) * apply_image(data.spectrum_sample, mtl.scattering, data.tex, scene, nullptr);
     result.properties = BSDFSample::Transmission | BSDFSample::MediumChanged | delta_sample;
     result.medium_index = in_outside ? mtl.int_medium : mtl.ext_medium;
   }
