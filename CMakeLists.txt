@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0048 NEW)
 cmake_policy(SET CMP0074 NEW)
 cmake_policy(SET CMP0091 NEW)
@@ -54,6 +54,7 @@ if (EXISTS "${bin_dir}")
       "${bin_dir}/*.spd"
       "${bin_dir}/*.materials")
   endif()
+  list(FILTER bin_files EXCLUDE REGEX "[/\\\\]assets_testing[/\\\\]")
   if (bin_files)
     add_custom_target(data SOURCES ${bin_files})
     source_group(TREE "${bin_dir}" PREFIX "data" FILES ${bin_files})
