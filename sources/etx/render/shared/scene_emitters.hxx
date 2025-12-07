@@ -218,10 +218,16 @@ ETX_GPU_CODE EmitterSample emitter_sample_in(const Emitter& em_inst, const Spect
 }
 
 ETX_GPU_CODE float emitter_discrete_pdf(const Emitter& emitter, const Distribution& dist) {
+  if (dist.total_weight == 0.0f) {
+    return 0.0f;
+  }
   return (emitter.spectrum_weight * emitter.additional_weight) / dist.total_weight;
 }
 
 ETX_GPU_CODE uint32_t sample_emitter_index(const Scene& scene, float rnd) {
+  if ((scene.emitter_instances.count == 0) || (scene.emitters_distribution.values.count == 0)) {
+    return kInvalidIndex;
+  }
   float pdf_sample = 0.0f;
   uint32_t emitter_index = static_cast<uint32_t>(scene.emitters_distribution.sample(rnd, pdf_sample));
   ETX_ASSERT(emitter_index < scene.emitters_distribution.values.count);
@@ -229,6 +235,9 @@ ETX_GPU_CODE uint32_t sample_emitter_index(const Scene& scene, float rnd) {
 }
 
 ETX_GPU_CODE EmitterSample sample_emitter(SpectralQuery spect, uint32_t emitter_index, const float2& smp, const float3& from_point, const Scene& scene) {
+  if ((scene.emitter_instances.count == 0) || (emitter_index == kInvalidIndex) || (emitter_index >= scene.emitter_instances.count)) {
+    return {};
+  }
   const auto& emitter = scene.emitter_instances[emitter_index];
   EmitterSample sample = emitter_sample_in(emitter, spect, from_point, scene, smp);
   sample.pdf_sample = emitter_discrete_pdf(emitter, scene.emitters_distribution);
@@ -239,9 +248,14 @@ ETX_GPU_CODE EmitterSample sample_emitter(SpectralQuery spect, uint32_t emitter_
 }
 
 ETX_GPU_CODE const EmitterSample sample_emission(const Scene& scene, SpectralQuery spect, Sampler& smp) {
+  if ((scene.emitter_instances.count == 0) || (scene.emitters_distribution.values.count == 0)) {
+    return {};
+  }
   EmitterSample result = {};
   result.emitter_index = scene.emitters_distribution.sample(smp.next(), result.pdf_sample);
-  ETX_ASSERT(result.emitter_index < scene.emitter_instances.count);
+  if ((result.emitter_index == kInvalidIndex) || (result.emitter_index >= scene.emitter_instances.count)) {
+    return {};
+  }
 
   const auto& em_inst = scene.emitter_instances[result.emitter_index];
   const auto& em = scene.emitter_profiles[em_inst.profile];

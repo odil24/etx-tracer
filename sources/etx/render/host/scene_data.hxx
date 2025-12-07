@@ -111,6 +111,17 @@ struct SceneData {
     return index;
   }
 
+  uint32_t clone_material(const Material& src, const char* name = nullptr) {
+    uint32_t index = static_cast<uint32_t>(materials.size());
+    materials.emplace_back(src);
+    std::string id = (name != nullptr) && (name[0] != 0) ? name : ("material-" + std::to_string(index));
+    if (material_mapping.count(id) > 0) {
+      id += "#" + std::to_string(index);
+    }
+    material_mapping[id] = index;
+    return index;
+  }
+
   uint32_t add_mesh(const char* name, uint32_t triangle_offset, uint32_t triangle_count, const float3& bbox_min, const float3& bbox_max) {
     uint32_t index = static_cast<uint32_t>(meshes.size());
     auto& mesh = meshes.emplace_back();

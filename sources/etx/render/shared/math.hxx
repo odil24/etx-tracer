@@ -110,6 +110,7 @@ constexpr float kMaxHalf = 65504.0f;
 constexpr float kInvMaxHalf = 1.0f / kMaxHalf;
 constexpr float kRayEpsilon = 15.0f / (kMaxHalf - 1.0f);
 constexpr float kDeltaAlphaTreshold = 1.0e-4f;
+constexpr float kGoldenRatio = 1.6180339887498948482f;
 
 constexpr uint32_t kInvalidIndex = ~0u;
 

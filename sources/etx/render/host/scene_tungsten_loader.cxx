@@ -44,6 +44,21 @@ const char* get_ext(const std::string& path) {
   return path.c_str() + pos;
 }
 
+SpectralDistribution json_to_rgb_spectrum(const nlohmann::json& v, float def_value) {
+  if (v.is_array() && v.size() >= 3) {
+    float3 c = {def_value, def_value, def_value};
+    c.x = v[0].is_number() ? float(v[0].get<double>()) : c.x;
+    c.y = v[1].is_number() ? float(v[1].get<double>()) : c.y;
+    c.z = v[2].is_number() ? float(v[2].get<double>()) : c.z;
+    return SpectralDistribution::rgb_luminance(c);
+  }
+  if (v.is_number()) {
+    float s = float(v.get<double>());
+    return SpectralDistribution::rgb_luminance({s, s, s});
+  }
+  return SpectralDistribution::rgb_luminance({def_value, def_value, def_value});
+}
+
 float3 rotate_yxz_deg(const float3& v, const float3& rot_deg) {
   const float3 r = rot_deg * (kPi / 180.0f);
   const float c0 = cosf(r.x);
@@ -153,8 +168,10 @@ struct PrimitiveLoadResult {
   uint32_t flags = 0u;
 };
 
-bool add_builtin_quad(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data);
-bool add_builtin_cube(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data);
+bool add_builtin_quad(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data, const char* name);
+bool add_builtin_cube(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data, const char* name);
+bool add_builtin_disk(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data, const char* name);
+bool add_builtin_sphere(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data, const char* name);
 bool load_wo3_mesh(const std::string& resolved, const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data,
   bool recompute_normals);
 void transform_vertices(SceneData& data, uint32_t vertex_start, uint32_t vertex_end, const float3& rotation_deg, const float3& scale, const float3& translate);
@@ -326,10 +343,15 @@ PrimitiveLoadResult handle_skydome(const nlohmann::json& prim, SceneData& data, 
 PrimitiveLoadResult handle_builtin_primitive(const std::string& type, const float3& translate, const float3& scale, const float3& rotation, uint32_t material_index,
   SceneData& data) {
   PrimitiveLoadResult r = {};
+  std::string mesh_name = type + "#" + std::to_string(data.meshes.size());
   if (type == "quad") {
-    r.loaded = add_builtin_quad(translate, scale, rotation, material_index, data);
+    r.loaded = add_builtin_quad(translate, scale, rotation, material_index, data, mesh_name.c_str());
   } else if (type == "cube") {
-    r.loaded = add_builtin_cube(translate, scale, rotation, material_index, data);
+    r.loaded = add_builtin_cube(translate, scale, rotation, material_index, data, mesh_name.c_str());
+  } else if (type == "disk") {
+    r.loaded = add_builtin_disk(translate, scale, rotation, material_index, data, mesh_name.c_str());
+  } else if (type == "sphere") {
+    r.loaded = add_builtin_sphere(translate, scale, rotation, material_index, data, mesh_name.c_str());
   } else if (type != "mesh") {
     log::warning("Unsupported Tungsten primitive type: %s", type.c_str());
   }
@@ -457,6 +479,45 @@ uint32_t add_tungsten_material(const std::string& name, const nlohmann::json& b,
   mtl.int_ior.cls = SpectralDistribution::Class::Dielectric;
   mtl.int_ior.eta_index = data.add_spectrum(SpectralDistribution::constant(1.5f));
   mtl.int_ior.k_index = data.add_spectrum(SpectralDistribution::constant(0.0f));
+
+  if (type == "smooth_coat") {
+    auto find_material_index = [&](const std::string& id) -> uint32_t {
+      auto it = data.material_mapping.find(id);
+      if (it != data.material_mapping.end())
+        return it->second;
+      return kInvalidIndex;
+    };
+
+    uint32_t base_material = kInvalidIndex;
+    if (b.contains("substrate")) {
+      const auto& coat_base = b["substrate"];
+      if (coat_base.is_string()) {
+        base_material = find_material_index(coat_base.get<std::string>());
+      } else if (coat_base.is_object()) {
+        std::string base_name = name.empty() ? std::string("__coat_base_") + std::to_string(data.materials.size()) : name + "__coat_base";
+        base_material = add_tungsten_material(base_name, coat_base, data, context, base_dir, database, force_two_sided);
+      }
+    }
+
+    if (base_material != kInvalidIndex) {
+      data.materials[mat_idx] = data.materials[base_material];
+    }
+
+    float coat_thickness = b.value("thickness", 0.0f);
+    float coat_ior = b.value("ior", 1.5f);
+    float thickness_nm = coat_thickness * 100.0f;
+    if (thickness_nm > 0.0f) {
+      mtl.thinfilm.min_thickness = thickness_nm;
+      mtl.thinfilm.max_thickness = thickness_nm;
+      mtl.thinfilm.ior.cls = SpectralDistribution::Class::Dielectric;
+      mtl.thinfilm.ior.eta_index = data.add_spectrum(SpectralDistribution::constant(coat_ior));
+      mtl.thinfilm.ior.k_index = data.add_spectrum(SpectralDistribution::constant(0.0f));
+    }
+
+    if (force_two_sided)
+      mtl.two_sided = 1u;
+    return mat_idx;
+  }
 
   if (type == "lambert" || type == "oren_nayar") {
     mtl.cls = Material::Class::Diffuse;
@@ -650,7 +711,7 @@ void set_emission_from_json(Material& mtl, const nlohmann::json& v, SceneData& d
   }
 }
 
-bool add_builtin_quad(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data) {
+bool add_builtin_quad(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data, const char* name) {
   const uint32_t vertex_offset = static_cast<uint32_t>(data.vertices.pos.size());
   float3 edge0 = {scale.x, 0.0f, 0.0f};
   float3 edge1 = {0.0f, 0.0f, scale.z};
@@ -718,11 +779,12 @@ bool add_builtin_quad(const float3& translate, const float3& scale, const float3
   data.triangle_to_emitter.emplace_back(kInvalidIndex);
   data.triangle_to_emitter.emplace_back(kInvalidIndex);
 
-  data.add_mesh("quad", tri_start, 2, bbox_min, bbox_max);
+  const char* mesh_name = (name != nullptr) && (name[0] != 0) ? name : "quad";
+  data.add_mesh(mesh_name, tri_start, 2, bbox_min, bbox_max);
   return true;
 }
 
-bool add_builtin_cube(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data) {
+bool add_builtin_cube(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data, const char* name) {
   const float3 h = 0.5f * scale;
   const uint32_t vertex_offset = static_cast<uint32_t>(data.vertices.pos.size());
 
@@ -818,7 +880,212 @@ bool add_builtin_cube(const float3& translate, const float3& scale, const float3
   if (tri_end == tri_start)
     return false;
 
-  data.add_mesh("cube", tri_start, tri_end - tri_start, bbox_min, bbox_max);
+  const char* mesh_name = (name != nullptr) && (name[0] != 0) ? name : "cube";
+  data.add_mesh(mesh_name, tri_start, tri_end - tri_start, bbox_min, bbox_max);
+  return true;
+}
+
+bool add_builtin_sphere(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data, const char* name) {
+  float radius = max(max(fabsf(scale.x), fabsf(scale.y)), fabsf(scale.z));
+  if (radius <= kEpsilon)
+    return false;
+
+  float target_edge = 0.025f;
+  int subdiv = static_cast<int>(ceilf(log2f(max(radius / target_edge, 1.0f))));
+  subdiv = clamp(subdiv, 0, 6);
+
+  struct EdgeKey {
+    uint32_t a;
+    uint32_t b;
+    bool operator==(const EdgeKey& other) const {
+      return (a == other.a) && (b == other.b);
+    }
+  };
+  struct EdgeHash {
+    size_t operator()(const EdgeKey& k) const {
+      return (static_cast<size_t>(k.a) << 32) ^ static_cast<size_t>(k.b);
+    }
+  };
+
+  std::vector<float3> verts = {
+    {-1, kGoldenRatio, 0},
+    {1, kGoldenRatio, 0},
+    {-1, -kGoldenRatio, 0},
+    {1, -kGoldenRatio, 0},
+    {0, -1, kGoldenRatio},
+    {0, 1, kGoldenRatio},
+    {0, -1, -kGoldenRatio},
+    {0, 1, -kGoldenRatio},
+    {kGoldenRatio, 0, -1},
+    {kGoldenRatio, 0, 1},
+    {-kGoldenRatio, 0, -1},
+    {-kGoldenRatio, 0, 1},
+  };
+  for (auto& v : verts)
+    v = normalize(v);
+
+  std::vector<uint3> faces = {
+    {0, 11, 5},
+    {0, 5, 1},
+    {0, 1, 7},
+    {0, 7, 10},
+    {0, 10, 11},
+    {1, 5, 9},
+    {5, 11, 4},
+    {11, 10, 2},
+    {10, 7, 6},
+    {7, 1, 8},
+    {3, 9, 4},
+    {3, 4, 2},
+    {3, 2, 6},
+    {3, 6, 8},
+    {3, 8, 9},
+    {4, 9, 5},
+    {2, 4, 11},
+    {6, 2, 10},
+    {8, 6, 7},
+    {9, 8, 1},
+  };
+
+  auto midpoint = [&](uint32_t a, uint32_t b, std::unordered_map<EdgeKey, uint32_t, EdgeHash>& cache) -> uint32_t {
+    EdgeKey key{std::min(a, b), std::max(a, b)};
+    auto it = cache.find(key);
+    if (it != cache.end())
+      return it->second;
+    float3 m = normalize(verts[a] + verts[b]);
+    uint32_t idx = static_cast<uint32_t>(verts.size());
+    verts.emplace_back(m);
+    cache[key] = idx;
+    return idx;
+  };
+
+  for (int s = 0; s < subdiv; ++s) {
+    std::unordered_map<EdgeKey, uint32_t, EdgeHash> cache;
+    std::vector<uint3> new_faces;
+    new_faces.reserve(faces.size() * 4);
+    for (const auto& f : faces) {
+      uint32_t a = f.x;
+      uint32_t b = f.y;
+      uint32_t c = f.z;
+      uint32_t ab = midpoint(a, b, cache);
+      uint32_t bc = midpoint(b, c, cache);
+      uint32_t ca = midpoint(c, a, cache);
+      new_faces.push_back({a, ab, ca});
+      new_faces.push_back({b, bc, ab});
+      new_faces.push_back({c, ca, bc});
+      new_faces.push_back({ab, bc, ca});
+    }
+    faces.swap(new_faces);
+  }
+
+  uint32_t vertex_offset = static_cast<uint32_t>(data.vertices.pos.size());
+  float3 bbox_min = {kMaxFloat, kMaxFloat, kMaxFloat};
+  float3 bbox_max = {-kMaxFloat, -kMaxFloat, -kMaxFloat};
+
+  for (const auto& v : verts) {
+    float3 p = v * radius;
+    p = rotate_yxz_deg(p, rotation_deg);
+    p += translate;
+    float3 n = rotate_yxz_deg(v, rotation_deg);
+    n = (length(n) > kEpsilon) ? (n / length(n)) : float3{0.0f, 1.0f, 0.0f};
+    data.vertices.pos.emplace_back(p);
+    data.vertices.nrm.emplace_back(n);
+    data.vertices.tan.emplace_back(float3{0.0f, 0.0f, 0.0f});
+    data.vertices.btn.emplace_back(float3{0.0f, 0.0f, 0.0f});
+    data.vertices.tex.emplace_back(float2{0.0f, 0.0f});
+    bbox_min = min(bbox_min, p);
+    bbox_max = max(bbox_max, p);
+  }
+
+  uint32_t tri_start = static_cast<uint32_t>(data.triangles.size());
+  for (const auto& f : faces) {
+    Triangle t{};
+    t.i[0] = vertex_offset + f.x;
+    t.i[1] = vertex_offset + f.y;
+    t.i[2] = vertex_offset + f.z;
+    t.material_index = material_index;
+    if (validate_triangle(t, data.vertices.pos) == false)
+      continue;
+    data.triangles.emplace_back(t);
+    data.triangle_to_emitter.emplace_back(kInvalidIndex);
+  }
+
+  uint32_t tri_end = static_cast<uint32_t>(data.triangles.size());
+  if (tri_end == tri_start)
+    return false;
+
+  const char* mesh_name = (name != nullptr) && (name[0] != 0) ? name : "sphere";
+  data.add_mesh(mesh_name, tri_start, tri_end - tri_start, bbox_min, bbox_max);
+  return true;
+}
+bool add_builtin_disk(const float3& translate, const float3& scale, const float3& rotation_deg, uint32_t material_index, SceneData& data, const char* name) {
+  float radius = 0.5f * max(fabsf(scale.x), fabsf(scale.z));
+  if (radius <= kEpsilon)
+    return false;
+
+  float circumference = 2.0f * kPi * radius;
+  float target_edge = 0.025f;
+  uint32_t segments = static_cast<uint32_t>(ceilf(circumference / target_edge));
+  segments = clamp(segments, 12u, 256u);
+
+  const uint32_t vertex_offset = static_cast<uint32_t>(data.vertices.pos.size());
+  float3 up = rotate_yxz_deg(float3{0.0f, 1.0f, 0.0f}, rotation_deg);
+  float3 tan = rotate_yxz_deg(float3{1.0f, 0.0f, 0.0f}, rotation_deg);
+  float3 btn = rotate_yxz_deg(float3{0.0f, 0.0f, 1.0f}, rotation_deg);
+  up = (length(up) > kEpsilon) ? (up / length(up)) : float3{0.0f, 1.0f, 0.0f};
+  tan = (length(tan) > kEpsilon) ? (tan / length(tan)) : float3{1.0f, 0.0f, 0.0f};
+  btn = (length(btn) > kEpsilon) ? (btn / length(btn)) : float3{0.0f, 0.0f, 1.0f};
+
+  data.vertices.pos.emplace_back(translate);
+  data.vertices.nrm.emplace_back(up);
+  data.vertices.tan.emplace_back(tan);
+  data.vertices.btn.emplace_back(btn);
+  data.vertices.tex.emplace_back(float2{0.5f, 0.5f});
+
+  float3 bbox_min = translate;
+  float3 bbox_max = translate;
+
+  for (uint32_t i = 0; i < segments; ++i) {
+    float angle = (2.0f * kPi * float(i)) / float(segments);
+    float x = radius * cosf(angle);
+    float z = radius * sinf(angle);
+    float3 p = rotate_yxz_deg(float3{x, 0.0f, z}, rotation_deg) + translate;
+
+    data.vertices.pos.emplace_back(p);
+    data.vertices.nrm.emplace_back(up);
+    data.vertices.tan.emplace_back(tan);
+    data.vertices.btn.emplace_back(btn);
+    data.vertices.tex.emplace_back(float2{0.5f + 0.5f * (x / radius), 0.5f + 0.5f * (z / radius)});
+
+    bbox_min = min(bbox_min, p);
+    bbox_max = max(bbox_max, p);
+  }
+
+  const uint32_t tri_start = static_cast<uint32_t>(data.triangles.size());
+  for (uint32_t i = 0; i < segments; ++i) {
+    uint32_t i0 = vertex_offset;  // center
+    uint32_t i1 = vertex_offset + 1 + i;
+    uint32_t i2 = vertex_offset + 1 + ((i + 1) % segments);
+
+    Triangle t{};
+    t.i[0] = i0;
+    t.i[1] = i1;
+    t.i[2] = i2;
+    t.material_index = material_index;
+
+    if (validate_triangle(t, data.vertices.pos) == false)
+      continue;
+
+    data.triangles.emplace_back(t);
+    data.triangle_to_emitter.emplace_back(kInvalidIndex);
+  }
+
+  uint32_t tri_end = static_cast<uint32_t>(data.triangles.size());
+  if (tri_end == tri_start)
+    return false;
+
+  const char* mesh_name = (name != nullptr) && (name[0] != 0) ? name : "disk";
+  data.add_mesh(mesh_name, tri_start, tri_end - tri_start, bbox_min, bbox_max);
   return true;
 }
 
@@ -1013,6 +1280,44 @@ bool load_wo3_mesh(const std::string& resolved, const float3& translate, const f
   return true;
 }
 
+void load_tungsten_media(const nlohmann::json& js, SceneData& data, SceneLoaderContext& context, Scene& scene) {
+  if (js.contains("media") == false || js["media"].is_array() == false)
+    return;
+
+  uint32_t loaded = 0;
+  for (const auto& m : js["media"]) {
+    if (m.is_object() == false)
+      continue;
+    std::string name = m.value("name", "");
+    if (name.empty())
+      name = std::string("medium-") + std::to_string(context.mediums.array_size());
+
+    std::string type = m.value("type", "homogeneous");
+    if (type != "homogeneous") {
+      log::warning("Unsupported Tungsten medium type: %s", type.c_str());
+      continue;
+    }
+
+    float g = 0.0f;
+    if (m.contains("phase_function") && m["phase_function"].is_object()) {
+      const auto& pf = m["phase_function"];
+      std::string pf_type = pf.value("type", "isotropic");
+      if (pf_type == "henyey_greenstein")
+        g = pf.value("g", 0.0f);
+    }
+
+    SpectralDistribution s_a = json_to_rgb_spectrum(m.value("sigma_a", 0.0f), 0.0f);
+    SpectralDistribution s_s = json_to_rgb_spectrum(m.value("sigma_s", 0.0f), 0.0f);
+
+    context.add_medium(scene, data, Medium::Class::Homogeneous, name.c_str(), nullptr, s_a, s_s, g, true);
+    ++loaded;
+  }
+
+  if (loaded > 0) {
+    scene.mediums = {context.mediums.as_array(), context.mediums.array_size()};
+  }
+}
+
 uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir, const std::unordered_map<std::string, uint32_t>& bsdf_to_mat, SceneData& data,
   SceneLoaderContext& context, Scene& scene, const IORDatabase& database, TaskScheduler& scheduler, Camera& active_camera, bool force_two_sided) {
   uint32_t load_flags = SceneLoadFailed;
@@ -1048,17 +1353,20 @@ uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir
     }
 
     uint32_t material_index = scene.missing_material;
-    if (prim.contains("bsdf")) {
-      const auto& bsdf_node = prim["bsdf"];
-      if (bsdf_node.is_string()) {
-        std::string bsdf_name = bsdf_node.get<std::string>();
+    bool bsdf_is_string = false;
+    std::string bsdf_name;
+    const nlohmann::json* bsdf_node = prim.contains("bsdf") ? &prim["bsdf"] : nullptr;
+    if (bsdf_node != nullptr) {
+      if (bsdf_node->is_string()) {
+        bsdf_is_string = true;
+        bsdf_name = bsdf_node->get<std::string>();
         auto it = bsdf_to_mat.find(bsdf_name);
         if (it != bsdf_to_mat.end()) {
           material_index = it->second;
         }
-      } else if (bsdf_node.is_object()) {
+      } else if (bsdf_node->is_object()) {
         std::string mat_name = std::string("__prim_bsdf_") + std::to_string(data.materials.size());
-        material_index = add_tungsten_material(mat_name, bsdf_node, data, context, base_dir, database, force_two_sided);
+        material_index = add_tungsten_material(mat_name, *bsdf_node, data, context, base_dir, database, force_two_sided);
       }
     }
 
@@ -1068,9 +1376,8 @@ uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir
     }
 
     bool two_sided = prim.value("two_sided", prim.value("twoSided", false));
-    if (prim.contains("bsdf") && prim["bsdf"].is_object()) {
-      const auto& bsdf_node = prim["bsdf"];
-      two_sided = two_sided || bsdf_node.value("two_sided", bsdf_node.value("twoSided", false));
+    if ((bsdf_node != nullptr) && bsdf_node->is_object()) {
+      two_sided = two_sided || bsdf_node->value("two_sided", bsdf_node->value("twoSided", false));
     }
     if (force_two_sided)
       two_sided = true;
@@ -1080,6 +1387,12 @@ uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir
     float emission_scale = 1.0f;
     if (prim.contains("scale") && prim["scale"].is_number())
       emission_scale = float(prim["scale"].get<double>());
+
+    bool wants_emission = has_power || has_emission;
+    if (wants_emission && bsdf_is_string && (material_index != scene.missing_material)) {
+      std::string clone_name = bsdf_name.empty() ? std::string{} : bsdf_name + "__emitter_" + std::to_string(data.materials.size());
+      material_index = data.clone_material(data.materials[material_index], clone_name.c_str());
+    }
 
     auto& mtl = data.materials[material_index];
     if (two_sided)
@@ -1129,7 +1442,7 @@ uint32_t load_tungsten_primitives(const nlohmann::json& js, const char* base_dir
         if (area <= 0.0f) {
           log::warning("Tungsten emitter has zero area, skipping power");
         } else {
-          float power_scale = emission_scale / (kPi * area);
+          float power_scale = emission_scale / (area * kPi);
           if (two_sided)
             power_scale *= 0.5f;
           set_emission_from_json(mtl, prim["power"], data, context, base_dir, power_scale);
@@ -1192,6 +1505,8 @@ uint32_t load_from_tungsten_file(const char* file_name, SceneData& data, SceneLo
   }
 
   bool camera_loaded = load_tungsten_camera(js, data, active_camera);
+
+  load_tungsten_media(js, data, context, scene);
 
   uint32_t load_result = load_tungsten_primitives(js, base_dir, bsdf_to_mat, data, context, scene, database, scheduler, active_camera, force_two_sided);
 

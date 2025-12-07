@@ -227,7 +227,6 @@ struct SceneRepresentationImpl {
           mtl.emission.spectrum_index = data.add_spectrum(SpectralDistribution::constant(0.0f));
         }
         if ((mtl.roughness.value.x > 0.0f) || (mtl.roughness.value.y > 0.0f)) {
-          constexpr float kEpsilon = 1e-6f;
           mtl.roughness.value.x = max(kEpsilon, mtl.roughness.value.x);
           mtl.roughness.value.y = max(kEpsilon, mtl.roughness.value.y);
         }
